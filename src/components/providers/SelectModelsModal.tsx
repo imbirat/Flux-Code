@@ -25,6 +25,10 @@ export default function SelectModelsModal({
   const refreshProviders = useStore((s) => s.refreshProviders);
   const [enabled, setEnabled] = useState<string[]>([]);
   const [discovered, setDiscovered] = useState<string[]>([]);
+  // Persisted + session-added manually configured ids. They appear as
+  // available candidates (with a "manual" badge) but stay unselected until
+  // the user enables them.
+  const [manualSet, setManualSet] = useState<string[]>([]);
   const [search, setSearch] = useState("");
   const [loading, setLoading] = useState(false);
   const [loadError, setLoadError] = useState("");
@@ -40,6 +44,7 @@ export default function SelectModelsModal({
     if (typeof def === "string" && def && !seed.includes(def)) seed.push(def);
     setEnabled(seed);
     setDiscovered([]);
+    setManualSet([...(provider.config.manualModels ?? [])]);
     setSearch("");
     setManual("");
     setManualError("");
@@ -57,7 +62,7 @@ export default function SelectModelsModal({
       const models = await api.providerListModels(id);
       setDiscovered(models);
       if (models.length === 0) {
-        setLoadError("No models returned — add model IDs manually below.");
+        setLoadError("No models discovered — add a model ID manually below.");
       }
     } catch (e) {
       setDiscovered([]);
@@ -67,9 +72,10 @@ export default function SelectModelsModal({
     }
   };
 
-  // All candidate ids: discovered ∪ enabled (enabled models are always listed
-  // so a temporary discovery failure cannot lose them).
-  const all = mergeManualIds(discovered, enabled);
+  // All candidate ids: discovered ∪ manually configured ∪ enabled (enabled
+  // models are always listed so a temporary discovery failure cannot lose
+  // them). Merging is deduped by the trimmed, exact model id.
+  const all = mergeManualIds(discovered, [...manualSet, ...enabled]);
   const visible = filterSearch(all, search);
 
   const toggle = (m: string) => {
@@ -94,8 +100,8 @@ export default function SelectModelsModal({
       }
     }
     setManualError("");
-    setDiscovered((cur) => mergeManualIds(cur, ids));
-    setEnabled((cur) => mergeManualIds(cur, ids));
+    // Candidates only: the user enables a manual model explicitly.
+    setManualSet((cur) => mergeManualIds(cur, ids));
     setManual("");
   };
 
@@ -110,6 +116,9 @@ export default function SelectModelsModal({
           : (enabled[0] ?? "");
       await api.providerSetConfig(provider.id, {
         enabledModels: enabled.sort((a, b) => a.localeCompare(b)),
+        // Persist the manual id set too (union of saved + session-added), so
+        // manually configured candidates survive reopening the app.
+        manualModels: mergeManualIds(provider.config.manualModels ?? [], manualSet),
         defaultModel: defaultModel || null,
       });
       await refreshProviders();
@@ -205,6 +214,11 @@ export default function SelectModelsModal({
                     </AnimatePresence>
                   </span>
                   <span className="min-w-0 flex-1 truncate font-mono text-[11.5px] text-dim">{m}</span>
+                  {manualSet.includes(m) && (
+                    <span className="flex-none rounded border border-line px-1.5 py-px font-mono text-[9.5px] uppercase tracking-wide text-faint">
+                      manual
+                    </span>
+                  )}
                 </button>
               );
             })}

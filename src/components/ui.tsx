@@ -114,13 +114,51 @@ export function Modal({
   children: ReactNode;
   wide?: boolean;
 }) {
+  const panelRef = useRef<HTMLDivElement>(null);
+
   useEffect(() => {
     if (!open) return;
+    const previouslyFocused = document.activeElement as HTMLElement | null;
+    // Keyboard users start inside the dialog, not on the page behind it.
+    const first = panelRef.current?.querySelector<HTMLElement>(
+      'a[href], button:not([disabled]), textarea, input, select',
+    );
+    (first ?? panelRef.current)?.focus();
+
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onClose();
+      if (e.key === "Escape") {
+        onClose();
+        return;
+      }
+      if (e.key !== "Tab") return;
+      // Keep Tab cycling within the dialog instead of escaping behind it.
+      const items = panelRef.current?.querySelectorAll<HTMLElement>(
+        'a[href], button:not([disabled]), textarea, input, select',
+      );
+      if (!items || items.length === 0) return;
+      const list = Array.from(items);
+      const first = list[0];
+      const last = list[list.length - 1];
+      const inside = panelRef.current?.contains(document.activeElement);
+      if (!inside) {
+        e.preventDefault();
+        (e.shiftKey ? last : first).focus();
+        return;
+      }
+      if (e.shiftKey && document.activeElement === first) {
+        e.preventDefault();
+        last.focus();
+      } else if (!e.shiftKey && document.activeElement === last) {
+        e.preventDefault();
+        first.focus();
+      }
     };
     document.addEventListener("keydown", onKey);
-    return () => document.removeEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("keydown", onKey);
+      // Hand focus back to whatever opened the modal.
+      previouslyFocused?.focus();
+    };
   }, [open, onClose]);
   return (
     <AnimatePresence>
@@ -136,12 +174,16 @@ export function Modal({
             onClick={onClose}
           />
           <motion.div
+            ref={panelRef}
             variants={modalPanel}
             initial="initial"
             animate="animate"
             exit="exit"
             transition={baseTransition}
-            className={`relative flex max-h-[88vh] flex-col overflow-hidden rounded-2xl border border-line bg-panel shadow-[0_24px_64px_rgba(0,0,0,0.5)] ${
+            role="dialog"
+            aria-modal="true"
+            tabIndex={-1}
+            className={`relative flex max-h-[88vh] flex-col overflow-hidden rounded-2xl border border-line bg-panel shadow-[0_24px_64px_rgba(0,0,0,0.5)] outline-none ${
               wide ? "w-[880px] max-w-[94vw]" : "w-[480px] max-w-[94vw]"
             }`}
           >

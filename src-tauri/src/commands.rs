@@ -161,6 +161,7 @@ fn builtin_info(app: &AppHandle, p: &providers::ProviderDef) -> Value {
         "config": {
             "enabledModels": config.get("enabledModels").cloned().unwrap_or(json!([])),
             "defaultModel": config.get("defaultModel").cloned().unwrap_or(json!(null)),
+            "manualModels": config.get("manualModels").cloned().unwrap_or(json!([])),
         },
     })
 }
@@ -265,58 +266,135 @@ async fn discover(app: &AppHandle, id: &str) -> (Vec<String>, bool, String) {
     }
 }
 
-/// Validate the connection: try model discovery first; for custom OpenAI-format
-/// providers without a listing endpoint, fall back to a real chat ping using
-/// the configured default model. The verdict is persisted.
-async fn test_provider(app: &AppHandle, id: &str) -> R<Value> {
-    let (models, discovery_ok, err) = discover(app, id).await;
-    let (status, message) = if discovery_ok {
-        (
+/// Pick the model used for a connection-test ping: the configured default
+/// model first, then manual IDs, then enabled ones. Empty when nothing is
+/// configured. Pure so the precedence is unit-testable.
+fn ping_candidate(default_model: &str, manual: &[String], enabled: &[String]) -> String {
+    let d = default_model.trim();
+    if !d.is_empty() {
+        return d.to_string();
+    }
+    manual
+        .iter()
+        .chain(enabled.iter())
+        .map(|s| s.trim())
+        .find(|s| !s.is_empty())
+        .unwrap_or("")
+        .to_string()
+}
+
+/// The ping model for a provider id, reading the correct store per kind:
+/// built-ins from the providers config table, customs from their own row.
+fn ping_model_for(app: &AppHandle, id: &str) -> String {
+    if providers::is_builtin(id) {
+        let cfg = db::provider_config_get(app, id);
+        let def = cfg.get("defaultModel").and_then(|v| v.as_str()).unwrap_or("");
+        let enabled: Vec<String> = cfg
+            .get("enabledModels")
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+            .unwrap_or_default();
+        ping_candidate(def, &[], &enabled)
+    } else {
+        db::custom_get(app, id)
+            .map(|row| ping_candidate(&row.default_model, &row.manual_models, &row.enabled_models))
+            .unwrap_or_default()
+    }
+}
+
+/// How many manually configured models a provider has (for status messaging).
+fn manual_model_count(app: &AppHandle, id: &str) -> usize {
+    if providers::is_builtin(id) {
+        db::provider_config_get(app, id)
+            .get("manualModels")
+            .and_then(|v| v.as_array())
+            .map(|a| a.len())
+            .unwrap_or(0)
+    } else {
+        db::custom_get(app, id)
+            .map(|row| row.manual_models.len())
+            .unwrap_or(0)
+    }
+}
+
+/// Decide the connection verdict from discovery and an optional chat ping.
+///
+/// Model discovery is deliberately separate from connectivity: an HTTP
+/// success always means the key and endpoint are valid, even when the catalog
+/// is empty. The ping only runs when listing failed outright (e.g. endpoints
+/// without a models route), validating the key against the real chat API.
+/// Pure so the whole decision matrix is unit-testable.
+fn connection_verdict(
+    discovery: Result<Vec<String>, String>,
+    ping: Option<Result<String, String>>,
+    manual_count: usize,
+) -> (String, String) {
+    match discovery {
+        Ok(models) if !models.is_empty() => (
             "connected".to_string(),
             format!("Connected — {} models available", models.len()),
-        )
+        ),
+        Ok(_) => {
+            if manual_count > 0 {
+                (
+                    "connected".to_string(),
+                    format!(
+                        "Connected — no models discovered. {manual_count} manual model{} configured.",
+                        if manual_count == 1 { "" } else { "s" }
+                    ),
+                )
+            } else {
+                (
+                    "connected".to_string(),
+                    "Connected — no models discovered. Add a model ID manually.".to_string(),
+                )
+            }
+        }
+        Err(err) => match ping {
+            Some(Ok(model)) => (
+                "connected".to_string(),
+                format!("Connected — model listing unavailable, using manual model \"{model}\""),
+            ),
+            Some(Err(ping_err)) => ("failed".to_string(), ping_err),
+            None => ("failed".to_string(), err),
+        },
+    }
+}
+
+/// Validate the connection: try model discovery first; for endpoints without
+/// a usable listing route, fall back to a real chat ping using the provider's
+/// own configured model (custom providers read their own row, built-ins the
+/// providers config table). The verdict is persisted.
+async fn test_provider(app: &AppHandle, id: &str) -> R<Value> {
+    let (models, discovery_ok, err) = discover(app, id).await;
+    let discovery = if discovery_ok {
+        Ok(models.clone())
     } else {
-        // Fallback: discovery may be unavailable on some endpoints while real
-        // chat still works. Ping with the provider's native chat shape using
-        // the configured default model.
-        let resolved = providers::resolve(app, id).ok();
-        let can_ping = resolved
-            .as_ref()
-            .map(|r| !r.base_url.is_empty())
-            .unwrap_or(false);
-        let key = crate::creds::get_key(id).ok().flatten().unwrap_or_default();
-        let mut ping_ok = false;
-        let mut ping_err = String::new();
-        let mut ping_model = String::new();
-        if can_ping && !key.is_empty() {
-            ping_model = db::provider_config_get(app, id)
-                .get("defaultModel")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            if !ping_model.is_empty() {
-                if let Some(r) = &resolved {
+        Err(err.clone())
+    };
+
+    // Fallback ping: only when listing failed. Ping with the provider's
+    // native chat shape using the model the user actually configured.
+    let mut ping: Option<Result<String, String>> = None;
+    if !discovery_ok {
+        if let Some(r) = providers::resolve(app, id).ok() {
+            if !r.base_url.is_empty() {
+                let key = crate::creds::get_key(id).ok().flatten().unwrap_or_default();
+                let ping_model = ping_model_for(app, id);
+                if !key.is_empty() && !ping_model.is_empty() {
                     match providers::ping_chat(&r.format, &r.base_url, &key, &r.extra_headers, &ping_model)
                         .await
                     {
-                        Ok(()) => ping_ok = true,
-                        Err(e) => ping_err = e,
+                        Ok(()) => ping = Some(Ok(ping_model)),
+                        Err(e) => ping = Some(Err(e)),
                     }
                 }
             }
         }
-        if ping_ok {
-            (
-                "connected".to_string(),
-                format!(
-                    "Connected — model listing unavailable, using manual model \"{ping_model}\""
-                ),
-            )
-        } else {
-            let msg = if ping_err.is_empty() { err } else { ping_err };
-            ("failed".to_string(), msg)
-        }
-    };
+    }
+
+    let manual_count = manual_model_count(app, id);
+    let (status, message) = connection_verdict(discovery, ping, manual_count);
     if providers::is_builtin(id) {
         db::status_set(app, id, &status, &message)?;
     } else if db::custom_get(app, id).is_ok() {
@@ -351,7 +429,9 @@ pub fn provider_get_config(app: AppHandle, id: String) -> R<Value> {
 }
 
 /// Persist enabled/default model selection. Built-ins go to the providers
-/// table; custom providers update their own row.
+/// table; custom providers update their own row. An optional `manualModels`
+/// list (the union persisted by Select Models) is honored for both kinds so
+/// manually added IDs survive reopening the app.
 #[tauri::command(rename_all = "camelCase")]
 pub fn provider_set_config(app: AppHandle, id: String, config: Value) -> R<()> {
     if providers::is_builtin(&id) {
@@ -362,6 +442,11 @@ pub fn provider_set_config(app: AppHandle, id: String, config: Value) -> R<()> {
                 .iter()
                 .filter_map(|x| x.as_str().map(String::from))
                 .collect();
+        }
+        if let Some(m) = config.get("manualModels").and_then(|v| v.as_array()) {
+            row.manual_models = providers::dedupe_sort(
+                m.iter().filter_map(|x| x.as_str().map(String::from)).collect(),
+            );
         }
         if let Some(m) = config.get("defaultModel") {
             row.default_model = m.as_str().unwrap_or("").to_string();
@@ -615,4 +700,101 @@ pub fn list_processes(app: AppHandle) -> R<Vec<Value>> {
 #[tauri::command]
 pub fn stop_process(app: AppHandle, id: u32) -> R<()> {
     terminal::stop(&app, id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ---------- connection verdicts (issue: status vs discovery) ----------
+
+    #[test]
+    fn verdict_connected_with_models() {
+        let (s, m) = connection_verdict(
+            Ok(vec!["a".into(), "b".into()]),
+            None,
+            0,
+        );
+        assert_eq!((s.as_str(), m.as_str()), ("connected", "Connected — 2 models available"));
+    }
+
+    #[test]
+    fn verdict_connected_when_catalog_empty() {
+        // An authenticated HTTP success is "connected" even with no models.
+        let (s, m) = connection_verdict(Ok(vec![]), None, 0);
+        assert_eq!(
+            (s.as_str(), m.as_str()),
+            ("connected", "Connected — no models discovered. Add a model ID manually.")
+        );
+    }
+
+    #[test]
+    fn verdict_connected_mentions_manual_models() {
+        let (s, m) = connection_verdict(Ok(vec![]), None, 2);
+        assert_eq!(
+            (s.as_str(), m.as_str()),
+            ("connected", "Connected — no models discovered. 2 manual models configured.")
+        );
+        let (s, m) = connection_verdict(Ok(vec![]), None, 1);
+        assert_eq!(
+            (s.as_str(), m.as_str()),
+            ("connected", "Connected — no models discovered. 1 manual model configured.")
+        );
+    }
+
+    #[test]
+    fn verdict_ping_success_overrides_listing_failure() {
+        let (s, m) = connection_verdict(
+            Err("Provider error 404: no such route".into()),
+            Some(Ok("my-model".into())),
+            3,
+        );
+        assert_eq!(
+            (s.as_str(), m.as_str()),
+            ("connected", "Connected — model listing unavailable, using manual model \"my-model\"")
+        );
+    }
+
+    #[test]
+    fn verdict_ping_failure_is_reported_not_the_listing_error() {
+        let (s, m) = connection_verdict(
+            Err("Provider error 404: no such route".into()),
+            Some(Err("Provider error 401: invalid key — check the API key in Settings › Providers".into())),
+            3,
+        );
+        assert_eq!(s, "failed");
+        assert!(m.contains("Provider error 401"));
+        assert!(!m.contains("no such route"));
+    }
+
+    #[test]
+    fn verdict_no_ping_reports_discovery_error() {
+        let (s, m) = connection_verdict(Err("Network error: connection refused".into()), None, 0);
+        assert_eq!((s.as_str(), m.as_str()), ("failed", "Network error: connection refused"));
+    }
+
+    #[test]
+    fn verdict_messages_never_leak_secrets() {
+        // Whatever the inputs, the verdict text must not contain a key-like
+        // token; errors are provider-provided status lines only.
+        let (_, m) = connection_verdict(
+            Err("Provider error 401: invalid key".into()),
+            Some(Err("Provider error 403: forbidden".into())),
+            5,
+        );
+        assert!(!m.contains("sk-"));
+        assert!(!m.contains("Bearer"));
+    }
+
+    // ---------- ping model precedence (issue: custom default model) ----------
+
+    #[test]
+    fn ping_candidate_prefers_default_then_manual_then_enabled() {
+        assert_eq!(ping_candidate("default-m", &["manual-m".into()], &["enabled-m".into()]), "default-m");
+        assert_eq!(ping_candidate("", &["manual-m".into()], &["enabled-m".into()]), "manual-m");
+        assert_eq!(ping_candidate("", &[], &["enabled-m".into()]), "enabled-m");
+        assert_eq!(ping_candidate("", &[], &[]), "");
+        // Blank entries are skipped, not returned.
+        assert_eq!(ping_candidate("  ", &["  ".into(), "real".into()], &[]), "real");
+    }
 }

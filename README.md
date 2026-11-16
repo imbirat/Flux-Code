@@ -20,7 +20,9 @@ A local-first AI coding agent for Windows. Native desktop app built with **Tauri
 
 ## Build from source
 
-Prerequisites: **Rust** (MSVC toolchain), **Node.js 18+**, Windows 10/11.
+Prerequisites: **Rust** (MSVC toolchain), **Node.js 22.22+** (or **24.15+**, or 26+) with **npm 10+**, Windows 10/11.
+
+The minimum Node.js version is set by the dev/test toolchain (Vitest 5 requires Node ≥ 22.12, jsdom 31 requires Node ≥ 22.22.2); `package.json` encodes this in its `engines` field, so `npm install` warns on older Node versions.
 
 ```bat
 npm install

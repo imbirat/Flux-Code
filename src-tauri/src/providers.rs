@@ -245,6 +245,29 @@ pub fn anthropic_next_page(v: &Value) -> Option<String> {
     }
 }
 
+/// The next OpenAI-style cursor for a listing page, per the OpenAI list-API
+/// convention (`has_more: bool` + `last_id` cursor). Providers that never
+/// paginate simply omit these fields and discovery stops after one page.
+pub fn openai_next_page(v: &Value) -> Option<String> {
+    if v.get("has_more").and_then(|b| b.as_bool()).unwrap_or(false) {
+        v.get("last_id")
+            .and_then(|t| t.as_str())
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+    } else {
+        None
+    }
+}
+
+/// URL for one OpenAI-style listing page. The `after` cursor is only appended
+/// when the previous page asked for a continuation.
+pub fn openai_page_url(base: &str, path: &str, after: Option<&str>) -> String {
+    match after {
+        Some(cursor) => format!("{base}{path}?after={}", urlencode(cursor)),
+        None => format!("{base}{path}"),
+    }
+}
+
 fn client() -> Result<reqwest::Client, String> {
     reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(20))
@@ -298,11 +321,15 @@ pub async fn list_models_http(
     };
 
     let mut models: Vec<String> = vec![];
+    // Hard caps so a misbehaving endpoint can never loop forever. The client
+    // also enforces a 45 s overall request timeout.
+    const MAX_PAGES: usize = 20;
     match format {
         // Gemini: paginate with nextPageToken until exhausted.
         "gemini" => {
             let mut token: Option<String> = None;
-            for _ in 0..20 {
+            let mut seen_tokens: Vec<String> = vec![];
+            for _ in 0..MAX_PAGES {
                 let mut url = format!(
                     "{base}{path}?pageSize=1000"
                 );
@@ -314,15 +341,24 @@ pub async fn list_models_http(
                 let v = send_json(req).await?;
                 models.extend(parse_gemini_models(&v));
                 token = gemini_next_page(&v);
-                if token.is_none() {
-                    break;
+                match token.as_deref() {
+                    None => break,
+                    Some(t) => {
+                        // Repeated cursor means the endpoint ignores paging —
+                        // stop instead of fetching the same page forever.
+                        if seen_tokens.iter().any(|s| s == t) {
+                            break;
+                        }
+                        seen_tokens.push(t.to_string());
+                    }
                 }
             }
         }
         // Anthropic: paginate with after_id following has_more/last_id.
         "anthropic" => {
             let mut after: Option<String> = None;
-            for _ in 0..100 {
+            let mut seen_cursors: Vec<String> = vec![];
+            for _ in 0..MAX_PAGES {
                 let mut url = format!("{base}{path}?limit=100");
                 if let Some(a) = &after {
                     url.push_str(&format!("&after_id={}", urlencode(a)));
@@ -332,30 +368,48 @@ pub async fn list_models_http(
                 let v = send_json(req).await?;
                 models.extend(parse_anthropic_models(&v));
                 after = anthropic_next_page(&v);
-                if after.is_none() {
-                    break;
+                match after.as_deref() {
+                    None => break,
+                    Some(a) => {
+                        if seen_cursors.iter().any(|s| s == a) {
+                            break;
+                        }
+                        seen_cursors.push(a.to_string());
+                    }
                 }
             }
         }
-        // OpenAI-compatible listings return one (possibly large) payload.
-        // Filter out models the API exposes that cannot serve chat completions.
+        // OpenAI-compatible: one page by default; follow the OpenAI list-API
+        // cursor (`has_more` + `last_id`, requested back via `?after=`) when
+        // the endpoint actually paginates. Endpoints that never paginate omit
+        // those fields, so the first response ends the loop unchanged.
         _ => {
-            let url = format!("{base}{path}");
-            let req = auth(client.get(&url), format, key);
-            let req = apply_headers(req, extra_headers);
-            let v = send_json(req).await?;
-            models.extend(parse_openai_models(&v));
+            let mut after: Option<String> = None;
+            let mut seen_cursors: Vec<String> = vec![];
+            for _ in 0..MAX_PAGES {
+                let url = openai_page_url(base, &path, after.as_deref());
+                let req = auth(client.get(&url), format, key);
+                let req = apply_headers(req, extra_headers);
+                let v = send_json(req).await?;
+                models.extend(parse_openai_models(&v));
+                after = openai_next_page(&v);
+                match after.as_deref() {
+                    None => break,
+                    Some(a) => {
+                        if seen_cursors.iter().any(|s| s == a) {
+                            break;
+                        }
+                        seen_cursors.push(a.to_string());
+                    }
+                }
+            }
             models.retain(|id| !looks_non_chat(id));
         }
     }
 
-    let models = dedupe_sort(models);
-    if models.is_empty() {
-        return Err(
-            "Connected, but the provider returned no models — add model IDs manually".into(),
-        );
-    }
-    Ok(models)
+    // An HTTP success with an empty catalog is a *successful discovery with
+    // zero results*, not an error: callers decide the connection verdict.
+    Ok(dedupe_sort(models))
 }
 
 fn apply_headers(
@@ -578,5 +632,144 @@ mod tests {
     fn urlencode_encodes_specials() {
         assert_eq!(urlencode("a b&c"), "a%20b%26c");
         assert_eq!(urlencode("safe-id.1~x"), "safe-id.1~x");
+    }
+
+    // ---------- OpenAI-style pagination ----------
+
+    #[test]
+    fn openai_next_page_requires_has_more_and_cursor() {
+        assert_eq!(
+            openai_next_page(&json!({ "has_more": true, "last_id": "b" })),
+            Some("b".to_string())
+        );
+        // No has_more, or no cursor, or an empty cursor all mean "stop".
+        assert_eq!(openai_next_page(&json!({ "has_more": false, "last_id": "b" })), None);
+        assert_eq!(openai_next_page(&json!({ "has_more": true })), None, "no cursor means stop");
+        assert_eq!(openai_next_page(&json!({ "has_more": true, "last_id": "" })), None);
+        assert_eq!(openai_next_page(&json!({})), None);
+    }
+
+    #[test]
+    fn openai_page_url_appends_cursor_only_when_present() {
+        assert_eq!(
+            openai_page_url("https://api.x.com/v1", "/models", None),
+            "https://api.x.com/v1/models"
+        );
+        assert_eq!(
+            openai_page_url("https://api.x.com/v1", "/models", Some("m-b")),
+            "https://api.x.com/v1/models?after=m-b"
+        );
+        assert_eq!(
+            openai_page_url("https://api.x.com/v1", "/models", Some("a b&c")),
+            "https://api.x.com/v1/models?after=a%20b%26c"
+        );
+    }
+
+    // ---------- discovery over a real mock HTTP server ----------
+
+    /// Serve a scripted sequence of (status, body) responses, one per accepted
+    /// connection, then stop. Pure std, no extra dependencies.
+    fn spawn_mock(responses: Vec<(u16, &'static str)>) -> String {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock");
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for (status, body) in responses {
+                let Ok((mut stream, _)) = listener.accept() else { break };
+                let mut buf = [0u8; 8192];
+                let _ = stream.read(&mut buf);
+                let resp = format!(
+                    "HTTP/1.1 {status} Status\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(resp.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn openai_discovery_follows_cursor_and_dedupes_pages() {
+        let base = spawn_mock(vec![
+            (200, r#"{"data":[{"id":"m-b"},{"id":"m-a"}],"has_more":true,"last_id":"m-b"}"#),
+            (200, r#"{"data":[{"id":"m-b"},{"id":"m-c"}],"has_more":false}"#),
+        ]);
+        let models = list_models_http("openai", &base, Some("k"), &[], "/models").await.unwrap();
+        assert_eq!(
+            models,
+            vec!["m-a".to_string(), "m-b".to_string(), "m-c".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn openai_discovery_stops_without_cursor() {
+        // Single-page response: no has_more/last_id, exactly one request.
+        let base = spawn_mock(vec![(200, r#"{"data":[{"id":"only"}]}"#)]);
+        let models = list_models_http("openai", &base, Some("k"), &[], "/models").await.unwrap();
+        assert_eq!(models, vec!["only".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn openai_discovery_empty_final_page_is_ok() {
+        let base = spawn_mock(vec![
+            (200, r#"{"data":[{"id":"m-a"}],"has_more":true,"last_id":"m-a"}"#),
+            (200, r#"{"data":[]}"#),
+        ]);
+        let models = list_models_http("openai", &base, Some("k"), &[], "/models").await.unwrap();
+        assert_eq!(models, vec!["m-a".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn discovery_empty_catalog_is_success_not_error() {
+        // Authenticated HTTP success with zero models: Ok(vec![]) — the caller
+        // decides the verdict (connection status is separate from discovery).
+        let base = spawn_mock(vec![(200, r#"{"data":[]}"#)]);
+        let models = list_models_http("openai", &base, Some("k"), &[], "/models").await.unwrap();
+        assert!(models.is_empty());
+    }
+
+    #[tokio::test]
+    async fn discovery_bad_key_is_a_failure_with_status() {
+        let base = spawn_mock(vec![(401, r#"{"error":{"message":"invalid key"}}"#)]);
+        let err = list_models_http("openai", &base, Some("bad"), &[], "/models")
+            .await
+            .unwrap_err();
+        assert!(err.starts_with("Provider error 401"), "got: {err}");
+        assert!(!err.contains("bad"), "the key itself must not appear");
+    }
+
+    #[tokio::test]
+    async fn discovery_mid_pagination_error_propagates() {
+        let base = spawn_mock(vec![
+            (200, r#"{"data":[{"id":"m-a"}],"has_more":true,"last_id":"m-a"}"#),
+            (429, r#"{"error":{"message":"slow down"}}"#),
+        ]);
+        let err = list_models_http("openai", &base, Some("k"), &[], "/models")
+            .await
+            .unwrap_err();
+        assert!(err.starts_with("Provider error 429"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn ping_chat_succeeds_on_success_status() {
+        let base = spawn_mock(vec![(200, r#"{"id":"resp-1"}"#)]);
+        assert!(ping_chat("openai", &base, "k", &[], "m-1").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn ping_chat_reports_auth_failure() {
+        let base = spawn_mock(vec![(403, r#"{"error":{"message":"forbidden"}}"#)]);
+        let err = ping_chat("openai", &base, "k", &[], "m-1").await.unwrap_err();
+        assert!(err.starts_with("Provider error 403"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn ping_chat_reports_unreachable_endpoint() {
+        // Port 1 on loopback is never listening: a clean network failure.
+        let err = ping_chat("openai", "http://127.0.0.1:1", "k", &[], "m-1").await.unwrap_err();
+        assert!(err.starts_with("Network error"), "got: {err}");
     }
 }

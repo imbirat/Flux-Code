@@ -95,6 +95,7 @@ export interface ProviderConfig {
   format?: string;
   headers?: Record<string, string>;
   modelsPath?: string;
+  manualModels?: string[];
   [key: string]: unknown;
 }
 
