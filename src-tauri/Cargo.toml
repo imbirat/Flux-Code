@@ -1,6 +1,6 @@
 [package]
 name = "fluxcode"
-version = "0.1.0"
+version = "1.2.3"
 description = "Flux Code — AI coding agent for Windows"
 authors = ["Flux Code"]
 edition = "2021"

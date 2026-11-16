@@ -4,6 +4,7 @@ import { PanelLeftClose, Plus, Settings, Trash2, Pencil, X } from "lucide-react"
 import { useStore } from "../lib/store";
 import { EASE, D } from "../lib/motion";
 import { FluxMark, IconButton, Tip } from "./ui";
+import ConfirmModal from "./ConfirmModal";
 
 function timeAgo(ts: number): string {
   const s = Math.floor((Date.now() - ts) / 1000);
@@ -28,6 +29,7 @@ export default function Sidebar() {
   const [editingId, setEditingId] = useState<string | null>(null);
   const [draft, setDraft] = useState("");
   const [menuFor, setMenuFor] = useState<string | null>(null);
+  const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
 
   return (
     <motion.aside
@@ -127,7 +129,7 @@ export default function Sidebar() {
                           className="h-6 w-6 hover:text-err"
                           title={t("common.delete")}
                           onClick={() => {
-                            deleteChat(c.id);
+                            setConfirmDelete(c.id);
                             setMenuFor(null);
                           }}
                         >
@@ -163,6 +165,23 @@ export default function Sidebar() {
           </button>
         </div>
       </div>
+
+      <ConfirmModal
+        open={confirmDelete !== null}
+        title={t("common.delete")}
+        message={t("session.delete.confirm").replace(
+          "{title}",
+          chats.find((c) => c.id === confirmDelete)?.title ?? "",
+        )}
+        confirmLabel={t("common.delete")}
+        cancelLabel={t("common.cancel")}
+        danger
+        onConfirm={() => {
+          if (confirmDelete) deleteChat(confirmDelete);
+          setConfirmDelete(null);
+        }}
+        onCancel={() => setConfirmDelete(null)}
+      />
 
       {/* collapsed rail */}
       <div

@@ -1,7 +1,9 @@
 import { useEffect } from "react";
 import { listen } from "@tauri-apps/api/event";
-import { MotionConfig, motion } from "motion/react";
+import { AnimatePresence, MotionConfig, motion } from "motion/react";
 import { useStore } from "./lib/store";
+import TopBar from "./components/TopBar";
+import ProjectsHome from "./components/ProjectsHome";
 import Sidebar from "./components/Sidebar";
 import ChatView from "./components/ChatView";
 import Composer from "./components/Composer";
@@ -10,6 +12,7 @@ import PermissionCard from "./components/PermissionCard";
 import QuestionCard from "./components/QuestionCard";
 import Settings from "./components/Settings";
 import { FluxMark } from "./components/ui";
+import { EASE, D } from "./lib/motion";
 
 const EVENTS = [
   "chat:start",
@@ -47,8 +50,35 @@ function Splash() {
   );
 }
 
+/** Transient global notice (project add failures, etc.). */
+function Toast() {
+  const toast = useStore((s) => s.toast);
+  useEffect(() => {
+    if (!toast) return;
+    const id = window.setTimeout(() => useStore.getState().setToast(null), 4000);
+    return () => window.clearTimeout(id);
+  }, [toast]);
+  return (
+    <AnimatePresence>
+      {toast && (
+        <motion.div
+          initial={{ opacity: 0, y: 8, x: "-50%" }}
+          animate={{ opacity: 1, y: 0, x: "-50%" }}
+          exit={{ opacity: 0, y: 4, x: "-50%" }}
+          transition={{ duration: D.base, ease: EASE }}
+          className="fixed bottom-4 left-1/2 z-[120] max-w-[70vw] truncate rounded-lg border border-line bg-raised px-3.5 py-2 text-[12.5px] text-ink shadow-[0_12px_32px_rgba(0,0,0,0.45)]"
+          data-testid="toast"
+        >
+          {toast}
+        </motion.div>
+      )}
+    </AnimatePresence>
+  );
+}
+
 export default function App() {
   const booted = useStore((s) => s.booted);
+  const view = useStore((s) => s.view);
   const settings = useStore((s) => s.settings);
   const init = useStore((s) => s.init);
   const onEvent = useStore((s) => s.onEvent);
@@ -110,25 +140,33 @@ export default function App() {
     return () => window.removeEventListener("keydown", onKey);
   }, [startNewChat, setSettingsOpen, setLeftOpen, setRightOpen]);
 
-  // ensure a chat exists once booted
-  useEffect(() => {
-    if (booted && !useStore.getState().activeChatId) startNewChat().catch(() => {});
-  }, [booted, startNewChat]);
+  // Startup shows the Projects/Sessions home. No session is created or opened
+  // automatically — the user decides (home page, search popup or main menu).
 
   if (!booted) return <Splash />;
 
   return (
     <MotionConfig reducedMotion={settings.reducedMotion ? "always" : "user"}>
-      <div className="flex h-full overflow-hidden bg-bg text-ink">
-        <Sidebar />
-        <main className="flex min-w-0 flex-1 flex-col">
-          <ChatView />
-          <PermissionCard />
-          <QuestionCard />
-          <Composer />
-        </main>
-        <RightPanel />
+      <div className="flex h-full flex-col overflow-hidden bg-bg text-ink">
+        <TopBar />
+        <div className="flex min-h-0 flex-1 overflow-hidden">
+          {view === "home" ? (
+            <ProjectsHome />
+          ) : (
+            <>
+              <Sidebar />
+              <main className="flex min-w-0 flex-1 flex-col">
+                <ChatView />
+                <PermissionCard />
+                <QuestionCard />
+                <Composer />
+              </main>
+              <RightPanel />
+            </>
+          )}
+        </div>
         <Settings />
+        <Toast />
       </div>
     </MotionConfig>
   );

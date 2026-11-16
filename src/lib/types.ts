@@ -71,6 +71,15 @@ export interface ChatSummary {
   permissionMode: string;
   createdAt: number;
   updatedAt: number;
+  projectId?: string | null;
+}
+
+export interface ProjectInfo {
+  id: string;
+  name: string;
+  path: string;
+  sort: number;
+  createdAt: number;
 }
 
 export interface Attachment {
@@ -122,6 +131,7 @@ export interface Settings {
   effortPrefs: Record<string, string>;
   lastProvider: string;
   lastModel: string;
+  lastProjectId?: string;
 }
 
 export interface PermissionRequest {

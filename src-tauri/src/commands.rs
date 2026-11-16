@@ -62,8 +62,17 @@ pub fn create_chat(
     model: String,
     effort: String,
     permission_mode: String,
+    project_id: Option<String>,
 ) -> R<db::ChatSummary> {
-    db::create_chat(&app, &workspace, &provider, &model, &effort, &permission_mode)
+    db::create_chat(
+        &app,
+        &workspace,
+        &provider,
+        &model,
+        &effort,
+        &permission_mode,
+        project_id.as_deref(),
+    )
 }
 
 #[tauri::command(rename_all = "camelCase")]
@@ -79,6 +88,50 @@ pub fn delete_chat(app: AppHandle, chat_id: String) -> R<()> {
 #[tauri::command(rename_all = "camelCase")]
 pub fn update_chat(app: AppHandle, chat_id: String, patch: Value) -> R<db::ChatSummary> {
     db::update_chat(&app, &chat_id, &patch)
+}
+
+// ---------- projects ----------
+
+/// Canonicalize a user-supplied folder path: absolute, existing, without the
+/// `\\?\` verbatim prefix Windows adds, and without trailing separators.
+fn canonical_project_path(raw: &str) -> R<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("Choose a folder for the project".into());
+    }
+    let p = std::fs::canonicalize(trimmed).map_err(|e| {
+        format!("Folder does not exist or is not accessible: {trimmed} ({e})")
+    })?;
+    if !p.is_dir() {
+        return Err(format!("Not a folder: {trimmed}"));
+    }
+    let s = p.to_string_lossy().trim_end_matches(['/', '\\']).to_string();
+    Ok(s.strip_prefix(r"\\?\").unwrap_or(&s).to_string())
+}
+
+#[tauri::command]
+pub fn project_list(app: AppHandle) -> R<Vec<db::Project>> {
+    db::list_projects(&app)
+}
+
+/// Register a project for a folder. Duplicate paths return the existing
+/// project (idempotent); the folder must exist and be readable.
+#[tauri::command(rename_all = "camelCase")]
+pub fn project_add(app: AppHandle, path: String, name: Option<String>) -> R<db::Project> {
+    let canonical = canonical_project_path(&path)?;
+    db::project_add(&app, &canonical, name.as_deref().unwrap_or(""))
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub fn project_rename(app: AppHandle, project_id: String, name: String) -> R<db::Project> {
+    db::project_rename(&app, &project_id, &name)
+}
+
+/// Remove a project. Sessions keep their history (project_id is cleared);
+/// files on disk are never touched.
+#[tauri::command(rename_all = "camelCase")]
+pub fn project_remove(app: AppHandle, project_id: String) -> R<()> {
+    db::project_remove(&app, &project_id)
 }
 
 #[tauri::command(rename_all = "camelCase")]

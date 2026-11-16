@@ -26,6 +26,11 @@ pub fn run() {
             commands::get_messages,
             commands::send_message,
             commands::cancel_chat,
+            // projects
+            commands::project_list,
+            commands::project_add,
+            commands::project_rename,
+            commands::project_remove,
             // permissions + questions
             commands::respond_permission,
             commands::respond_questions,

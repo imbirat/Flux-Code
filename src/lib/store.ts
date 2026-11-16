@@ -8,6 +8,7 @@ import type {
   MessageMeta,
   PermissionRequest,
   ProcessInfo,
+  ProjectInfo,
   ProviderInfo,
   QuestionRequest,
   Settings,
@@ -28,6 +29,10 @@ interface Store {
   providers: ProviderInfo[];
   chats: ChatSummary[];
   activeChatId: string | null;
+  projects: ProjectInfo[];
+  activeProjectId: string | null;
+  /** Top-level navigation: home = Projects/Sessions page, chat = session view. */
+  view: "home" | "chat";
   messages: Record<string, ChatMessage[]>;
   streaming: Record<string, StreamingBuf | undefined>;
   status: Record<string, string | undefined>;
@@ -45,13 +50,23 @@ interface Store {
   leftOpen: boolean;
   settingsOpen: boolean;
   setSettingsOpen: (open: boolean) => void;
+  /** Global transient notice (e.g. project add failures). */
+  toast: string | null;
+  setToast: (msg: string | null) => void;
 
   t: TFn;
   activeChat: () => ChatSummary | undefined;
+  activeProject: () => ProjectInfo | undefined;
+  setView: (view: "home" | "chat") => void;
   init: () => Promise<void>;
   applySettings: (patch: Partial<Settings>) => Promise<void>;
   refreshProviders: () => Promise<void>;
   refreshChats: () => Promise<void>;
+  refreshProjects: () => Promise<void>;
+  setActiveProject: (id: string | null) => void;
+  addProject: (path: string, name?: string) => Promise<ProjectInfo | null>;
+  renameProject: (id: string, name: string) => Promise<void>;
+  removeProject: (id: string) => Promise<void>;
   refreshProcesses: () => Promise<void>;
   loadMessages: (chatId: string) => Promise<void>;
   loadTodos: (chatId: string) => Promise<void>;
@@ -96,6 +111,9 @@ export const useStore = create<Store>((set, get) => ({
   providers: [],
   chats: [],
   activeChatId: null,
+  projects: [],
+  activeProjectId: null,
+  view: "home",
   messages: {},
   streaming: {},
   status: {},
@@ -113,12 +131,21 @@ export const useStore = create<Store>((set, get) => ({
   leftOpen: true,
   settingsOpen: false,
   setSettingsOpen: (open) => set({ settingsOpen: open }),
+  toast: null,
+  setToast: (msg) => set({ toast: msg }),
 
   t: makeT("default"),
   activeChat: () => {
     const { chats, activeChatId } = get();
     return chats.find((c) => c.id === activeChatId);
   },
+
+  activeProject: () => {
+    const { projects, activeProjectId } = get();
+    return projects.find((p) => p.id === activeProjectId);
+  },
+
+  setView: (view) => set({ view }),
 
   init: async () => {
     try {
@@ -127,6 +154,7 @@ export const useStore = create<Store>((set, get) => ({
     } catch {
       /* keep defaults */
     }
+    await get().refreshProjects();
     await get().refreshProviders();
     await get().refreshChats();
     await get().refreshProcesses().catch(() => {});
@@ -137,6 +165,15 @@ export const useStore = create<Store>((set, get) => ({
       }
     } catch {
       /* ignore */
+    }
+    // Restore the last used project. The view stays "home": startup never
+    // auto-creates or auto-opens a session — the user decides.
+    const { settings, projects } = get();
+    const last = settings.lastProjectId;
+    if (last && projects.some((p) => p.id === last)) {
+      set({ activeProjectId: last });
+    } else if (projects.length > 0) {
+      set({ activeProjectId: projects[0].id });
     }
     set({ booted: true });
   },
@@ -164,12 +201,69 @@ export const useStore = create<Store>((set, get) => ({
     try {
       const chats = await api.listChats();
       set({ chats });
-      const { activeChatId } = get();
-      if (!activeChatId && chats.length > 0) {
-        await get().openChat(chats[0].id);
-      }
     } catch {
       /* ignore */
+    }
+  },
+
+  refreshProjects: async () => {
+    try {
+      const projects = await api.projectList();
+      set((s) => ({
+        projects,
+        // Drop a stale selection (e.g. project removed in another view).
+        activeProjectId:
+          s.activeProjectId && projects.some((p) => p.id === s.activeProjectId)
+            ? s.activeProjectId
+            : (projects[0]?.id ?? null),
+      }));
+    } catch {
+      /* ignore */
+    }
+  },
+
+  setActiveProject: (id) => {
+    set({ activeProjectId: id });
+    if (id) {
+      // Persist the choice so it survives restarts (best effort).
+      get().applySettings({ lastProjectId: id }).catch(() => {});
+    }
+  },
+
+  addProject: async (path, name) => {
+    try {
+      const project = await api.projectAdd(path, name);
+      await get().refreshProjects();
+      set({ activeProjectId: project.id });
+      get().applySettings({ lastProjectId: project.id }).catch(() => {});
+      return project;
+    } catch (e) {
+      throw new Error(typeof e === "string" ? e : String(e));
+    }
+  },
+
+  renameProject: async (id, name) => {
+    try {
+      const updated = await api.projectRename(id, name);
+      set((s) => ({ projects: s.projects.map((p) => (p.id === id ? updated : p)) }));
+    } catch (e) {
+      throw new Error(typeof e === "string" ? e : String(e));
+    }
+  },
+
+  removeProject: async (id) => {
+    try {
+      await api.projectRemove(id);
+      await get().refreshChats();
+      await get().refreshProjects();
+      // If the active chat belonged to the removed project it is now unlinked;
+      // session data stays intact.
+      if (get().activeProjectId === id) {
+        const projects = get().projects;
+        set({ activeProjectId: projects[0]?.id ?? null });
+      }
+    } catch (e) {
+      throw new Error(typeof e === "string" ? e : String(e));
     }
   },
 
@@ -207,25 +301,43 @@ export const useStore = create<Store>((set, get) => ({
     if (chat?.provider && chat?.model) {
       get().ensureCaps(chat.provider, chat.model).catch(() => {});
     }
+    // Switch to the chat's project so the top bar identity stays truthful.
+    if (chat?.projectId) {
+      set({ view: "chat", activeProjectId: chat.projectId });
+    } else {
+      set({ view: "chat" });
+    }
   },
 
   startNewChat: async () => {
     const s = get();
-    if (s.chats[0] && Date.now() - s.chats[0].updatedAt < 2000 && !s.messages[s.chats[0].id]?.length) {
-      set({ activeChatId: s.chats[0].id });
+    const project = s.activeProject();
+    // Debounce double clicks: reuse a just-created empty chat of this project
+    // instead of stacking blank sessions.
+    const recentEmpty = s.chats.find(
+      (c) =>
+        (!project || c.projectId === project.id) &&
+        Date.now() - c.updatedAt < 2000 &&
+        !(s.messages[c.id]?.length ?? 0),
+    );
+    if (recentEmpty) {
+      await get().openChat(recentEmpty.id);
       return;
     }
-    const ws = s.settings.workspace || (await api.getDefaultWorkspace().catch(() => ""));
+    const ws = project?.path || s.settings.workspace || (await api.getDefaultWorkspace().catch(() => ""));
     const chat = await api.createChat({
       workspace: ws,
       provider: s.settings.lastProvider,
       model: s.settings.lastModel,
       effort: "",
       permissionMode: s.settings.defaultPermissionMode,
+      projectId: project?.id ?? null,
     });
     set((st) => ({
       chats: [chat, ...st.chats],
       activeChatId: chat.id,
+      view: "chat",
+      activeProjectId: chat.projectId ?? st.activeProjectId,
       messages: { ...st.messages, [chat.id]: [] },
       todos: { ...st.todos, [chat.id]: [] },
       tools: { ...st.tools, [chat.id]: {} },
@@ -251,9 +363,8 @@ export const useStore = create<Store>((set, get) => ({
     }
     await get().refreshChats();
     if (get().activeChatId === id) {
-      const next = get().chats[0];
-      if (next) await get().openChat(next.id);
-      else set({ activeChatId: null, messages: { ...get().messages, [id]: [] } });
+      // Never auto-open another session — return to the home page.
+      set({ activeChatId: null, view: "home", messages: { ...get().messages, [id]: [] } });
     }
   },
 
@@ -398,7 +509,7 @@ export const useStore = create<Store>((set, get) => ({
   setRightOpen: (open) => set({ rightOpen: open }),
   setLeftOpen: (open) => set({ leftOpen: open }),
 
-  onEvent: (name, p) => {
+  onEvent: async (name, p) => {
     const s = get();
     switch (name) {
       case "chat:start": {
@@ -480,10 +591,24 @@ export const useStore = create<Store>((set, get) => ({
       }
       case "permission:request": {
         set({ permission: p as PermissionRequest });
+        // The agent is blocked waiting for input — bring the session to the
+        // front so the permission card is reachable.
+        const req = p as PermissionRequest;
+        if (req.chatId && req.chatId !== get().activeChatId) {
+          await get().openChat(req.chatId).catch(() => {});
+        } else {
+          set({ view: "chat" });
+        }
         break;
       }
       case "question:request": {
         set({ question: p as QuestionRequest });
+        const req = p as QuestionRequest;
+        if (req.chatId && req.chatId !== get().activeChatId) {
+          await get().openChat(req.chatId).catch(() => {});
+        } else {
+          set({ view: "chat" });
+        }
         break;
       }
       case "terminal:chunk": {

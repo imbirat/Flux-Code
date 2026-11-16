@@ -18,6 +18,22 @@ pub struct ChatSummary {
     pub permission_mode: String,
     pub created_at: i64,
     pub updated_at: i64,
+    /// Project the session belongs to; `None` for legacy rows not yet matched
+    /// to a project or after their project was removed.
+    pub project_id: Option<String>,
+}
+
+/// A saved project: a stable identity for a workspace directory.
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct Project {
+    pub id: String,
+    pub name: String,
+    /// Canonical absolute filesystem path (unique, case-insensitive on
+    /// Windows-style filesystems).
+    pub path: String,
+    pub sort: i64,
+    pub created_at: i64,
 }
 
 #[derive(Serialize, Clone)]
@@ -61,6 +77,7 @@ pub fn init(app: &AppHandle) -> Result<(), String> {
     conn.pragma_update(None, "journal_mode", "WAL")
         .map_err(|e| e.to_string())?;
     migrate(&conn)?;
+    seed_projects(&conn, &crate::agent::default_workspace().to_string_lossy())?;
     app.manage(Db(Mutex::new(conn)));
     Ok(())
 }
@@ -118,9 +135,104 @@ fn migrate(conn: &Connection) -> Result<(), String> {
             message TEXT NOT NULL DEFAULT '',
             checked_at INTEGER NOT NULL DEFAULT 0
         );
+        CREATE TABLE IF NOT EXISTS projects(
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            path TEXT NOT NULL UNIQUE COLLATE NOCASE,
+            sort INTEGER NOT NULL DEFAULT 0,
+            created_at INTEGER NOT NULL
+        );
         "#,
     )
-    .map_err(|e| e.to_string())
+    .map_err(|e| e.to_string())?;
+    ensure_chat_project_column(conn)
+}
+
+/// Add `chats.project_id` for databases created before v1.2.3. Existing rows
+/// keep `NULL` until `seed_projects` assigns them.
+fn ensure_chat_project_column(conn: &Connection) -> Result<(), String> {
+    let has_column: bool = conn
+        .prepare("PRAGMA table_info(chats)")
+        .map_err(|e| e.to_string())?
+        .query_map([], |r| r.get::<_, String>(1))
+        .map_err(|e| e.to_string())?
+        .any(|c| c.map(|n| n == "project_id").unwrap_or(false));
+    if !has_column {
+        conn.execute_batch("ALTER TABLE chats ADD COLUMN project_id TEXT")
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+/// One-time project seeding for databases from before v1.2.3. Creates one
+/// project per distinct chat workspace (plus the default workspace when there
+/// is no project at all) and links every chat to the project matching its
+/// workspace. Never deletes or rewrites existing rows beyond setting the new
+/// `project_id` column.
+pub fn seed_projects(conn: &Connection, default_workspace: &str) -> Result<(), String> {
+    let project_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM projects", [], |r| r.get(0))
+        .map_err(|e| e.to_string())?;
+    if project_count == 0 {
+        // Projects from the distinct workspaces of existing chats.
+        let mut workspaces: Vec<String> = {
+            let mut st = conn
+                .prepare("SELECT DISTINCT workspace FROM chats WHERE workspace != '' ORDER BY workspace")
+                .map_err(|e| e.to_string())?;
+            let rows = st
+                .query_map([], |r| r.get::<_, String>(0))
+                .map_err(|e| e.to_string())?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?;
+            rows
+        };
+        // Always seed the default workspace project when nothing exists yet.
+        if workspaces.is_empty() {
+            workspaces.push(default_workspace.to_string());
+        }
+        for (i, ws) in workspaces.iter().enumerate() {
+            let path = ws.trim_end_matches(['/', '\\']).to_string();
+            if path.is_empty() {
+                continue;
+            }
+            let name = std::path::Path::new(&path)
+                .file_name()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_else(|| path.clone());
+            conn.execute(
+                "INSERT OR IGNORE INTO projects(id,name,path,sort,created_at) VALUES(?1,?2,?3,?4,?5)",
+                rusqlite::params![uid(), name, path, i as i64, now_ms()],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+    }
+    // Link chats to the project matching their workspace (case-insensitive),
+    // then fall back to the default project for anything still unassigned.
+    conn.execute(
+        "UPDATE chats SET project_id = (
+             SELECT p.id FROM projects p
+             WHERE p.path = chats.workspace COLLATE NOCASE
+             ORDER BY p.sort LIMIT 1
+         )
+         WHERE project_id IS NULL AND workspace != ''",
+        [],
+    )
+    .map_err(|e| e.to_string())?;
+    let default_project: Option<String> = conn
+        .query_row(
+            "SELECT id FROM projects WHERE path = ?1 COLLATE NOCASE ORDER BY sort LIMIT 1",
+            [default_workspace.trim_end_matches(['/', '\\'])],
+            |r| r.get(0),
+        )
+        .ok();
+    if let Some(pid) = default_project {
+        conn.execute(
+            "UPDATE chats SET project_id = ?1 WHERE project_id IS NULL",
+            [pid],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }
 
 /// Run a closure with the database connection. Never call `.await` inside `f`.
@@ -144,23 +256,26 @@ fn row_to_chat(r: &rusqlite::Row) -> rusqlite::Result<ChatSummary> {
         permission_mode: r.get(6)?,
         created_at: r.get(7)?,
         updated_at: r.get(8)?,
+        project_id: r.get(9)?,
     })
 }
 
 const CHAT_COLS: &str =
-    "id,title,workspace,provider,model,effort,permission_mode,created_at,updated_at";
+    "id,title,workspace,provider,model,effort,permission_mode,created_at,updated_at,project_id";
+
+fn chats_list_conn(c: &Connection) -> Result<Vec<ChatSummary>, String> {
+    let sql = format!("SELECT {CHAT_COLS} FROM chats ORDER BY updated_at DESC");
+    let mut st = c.prepare(&sql).map_err(|e| e.to_string())?;
+    let rows = st
+        .query_map([], row_to_chat)
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    Ok(rows)
+}
 
 pub fn list_chats(app: &AppHandle) -> Result<Vec<ChatSummary>, String> {
-    with(app, |c| {
-        let sql = format!("SELECT {CHAT_COLS} FROM chats ORDER BY updated_at DESC");
-        let mut st = c.prepare(&sql).map_err(|e| e.to_string())?;
-        let rows = st
-            .query_map([], row_to_chat)
-            .map_err(|e| e.to_string())?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| e.to_string())?;
-        Ok(rows)
-    })
+    with(app, |c| chats_list_conn(c))
 }
 
 pub fn create_chat(
@@ -170,14 +285,15 @@ pub fn create_chat(
     model: &str,
     effort: &str,
     mode: &str,
+    project_id: Option<&str>,
 ) -> Result<ChatSummary, String> {
     let id = uid();
     let t = now_ms();
     with(app, |c| {
         c.execute(
-            "INSERT INTO chats(id,title,workspace,provider,model,effort,permission_mode,created_at,updated_at)
-             VALUES(?1,'New chat',?2,?3,?4,?5,?6,?7,?7)",
-            rusqlite::params![id, workspace, provider, model, effort, mode, t],
+            "INSERT INTO chats(id,title,workspace,provider,model,effort,permission_mode,created_at,updated_at,project_id)
+             VALUES(?1,'New chat',?2,?3,?4,?5,?6,?7,?7,?8)",
+            rusqlite::params![id, workspace, provider, model, effort, mode, t, project_id],
         )
         .map_err(|e| e.to_string())?;
         Ok(())
@@ -192,6 +308,7 @@ pub fn create_chat(
         permission_mode: mode.into(),
         created_at: t,
         updated_at: t,
+        project_id: project_id.map(String::from),
     })
 }
 
@@ -204,6 +321,7 @@ pub fn update_chat(app: &AppHandle, id: &str, patch: &Value) -> Result<ChatSumma
             ("model", "model"),
             ("effort", "effort"),
             ("permissionMode", "permission_mode"),
+            ("projectId", "project_id"),
         ];
         let mut sets: Vec<String> = vec![];
         let mut vals: Vec<String> = vec![];
@@ -212,6 +330,10 @@ pub fn update_chat(app: &AppHandle, id: &str, patch: &Value) -> Result<ChatSumma
                 sets.push(format!("{col} = ?"));
                 vals.push(v.to_string());
             }
+        }
+        // projectId may also arrive as null (e.g. its project was removed).
+        if patch.get("projectId").map(|v| v.is_null()).unwrap_or(false) {
+            sets.push("project_id = NULL".into());
         }
         if !sets.is_empty() {
             sets.push("updated_at = ?".into());
@@ -226,13 +348,15 @@ pub fn update_chat(app: &AppHandle, id: &str, patch: &Value) -> Result<ChatSumma
     get_chat(app, id)
 }
 
+fn chat_get_conn(c: &Connection, id: &str) -> Result<ChatSummary, String> {
+    let sql = format!("SELECT {CHAT_COLS} FROM chats WHERE id = ?1");
+    let mut st = c.prepare(&sql).map_err(|e| e.to_string())?;
+    st.query_row([id], row_to_chat)
+        .map_err(|e| format!("chat not found: {e}"))
+}
+
 pub fn get_chat(app: &AppHandle, id: &str) -> Result<ChatSummary, String> {
-    with(app, |c| {
-        let sql = format!("SELECT {CHAT_COLS} FROM chats WHERE id = ?1");
-        let mut st = c.prepare(&sql).map_err(|e| e.to_string())?;
-        st.query_row([id], row_to_chat)
-            .map_err(|e| format!("chat not found: {e}"))
-    })
+    with(app, |c| chat_get_conn(c, id))
 }
 
 pub fn rename_chat(app: &AppHandle, id: &str, title: &str) -> Result<(), String> {
@@ -551,6 +675,134 @@ pub fn custom_status_set(app: &AppHandle, id: &str, status: &str, message: &str)
     })
 }
 
+// ---------- projects ----------
+
+fn row_to_project(r: &rusqlite::Row) -> rusqlite::Result<Project> {
+    Ok(Project {
+        id: r.get(0)?,
+        name: r.get(1)?,
+        path: r.get(2)?,
+        sort: r.get(3)?,
+        created_at: r.get(4)?,
+    })
+}
+
+fn projects_list_conn(c: &Connection) -> Result<Vec<Project>, String> {
+    let mut st = c
+        .prepare("SELECT id,name,path,sort,created_at FROM projects ORDER BY sort, created_at")
+        .map_err(|e| e.to_string())?;
+    let rows = st
+        .query_map([], row_to_project)
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    Ok(rows)
+}
+
+pub fn list_projects(app: &AppHandle) -> Result<Vec<Project>, String> {
+    with(app, |c| projects_list_conn(c))
+}
+
+/// Insert or return the existing project for a canonical path. Safe against
+/// duplicates (the path is UNIQUE COLLATE NOCASE) and races (INSERT OR IGNORE
+/// then re-read). An empty display name falls back to the folder basename.
+fn project_upsert_conn(c: &Connection, path: &str, name: &str) -> Result<Project, String> {
+    let path = path.trim().trim_end_matches(['/', '\\']).to_string();
+    if path.is_empty() {
+        return Err("Project path is empty".into());
+    }
+    let name = {
+        let n = name.trim();
+        if !n.is_empty() {
+            n.to_string()
+        } else {
+            std::path::Path::new(&path)
+                .file_name()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_else(|| path.clone())
+        }
+    };
+    if let Ok(existing) = c
+        .prepare("SELECT id,name,path,sort,created_at FROM projects WHERE path = ?1 COLLATE NOCASE")
+        .and_then(|mut st| st.query_row([&path], row_to_project))
+    {
+        return Ok(existing);
+    }
+    let sort: i64 = c
+        .query_row("SELECT COALESCE(MAX(sort), -1) + 1 FROM projects", [], |r| r.get(0))
+        .map_err(|e| e.to_string())?;
+    conn_execute_ignored(
+        c,
+        "INSERT OR IGNORE INTO projects(id,name,path,sort,created_at) VALUES(?1,?2,?3,?4,?5)",
+        rusqlite::params![uid(), name, path, sort, now_ms()],
+    )?;
+    c.prepare("SELECT id,name,path,sort,created_at FROM projects WHERE path = ?1 COLLATE NOCASE")
+        .and_then(|mut st| st.query_row([&path], row_to_project))
+        .map_err(|e| format!("project insert failed: {e}"))
+}
+
+fn conn_execute_ignored(
+    c: &Connection,
+    sql: &str,
+    params: impl rusqlite::Params,
+) -> Result<(), String> {
+    c.execute(sql, params).map(|_| ()).map_err(|e| e.to_string())
+}
+
+/// Register (or return) a project for a directory path. The caller must pass
+/// an existing, accessible directory path.
+pub fn project_add(app: &AppHandle, path: &str, name: &str) -> Result<Project, String> {
+    let path = path.trim().trim_end_matches(['/', '\\']).to_string();
+    if path.is_empty() {
+        return Err("Project path is empty".into());
+    }
+    if !std::path::Path::new(&path).is_dir() {
+        return Err(format!("Folder does not exist or is not accessible: {path}"));
+    }
+    let name = name.trim();
+    if !name.is_empty() && name.len() > 60 {
+        return Err("Project name is too long (max 60 characters)".into());
+    }
+    with(app, |c| project_upsert_conn(c, &path, name))
+}
+
+pub fn project_rename(app: &AppHandle, id: &str, name: &str) -> Result<Project, String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("Project name is required".into());
+    }
+    if name.len() > 60 {
+        return Err("Project name is too long (max 60 characters)".into());
+    }
+    with(app, |c| {
+        let n = c
+            .execute("UPDATE projects SET name = ?1 WHERE id = ?2", rusqlite::params![name, id])
+            .map_err(|e| e.to_string())?;
+        if n == 0 {
+            return Err(format!("Unknown project: {id}"));
+        }
+        c.prepare("SELECT id,name,path,sort,created_at FROM projects WHERE id = ?1")
+            .and_then(|mut st| st.query_row([id], row_to_project))
+            .map_err(|e| format!("project not found: {e}"))
+    })
+}
+
+/// Remove a project row without touching its sessions (their `project_id`
+/// becomes NULL) or the files on disk.
+pub fn project_remove(app: &AppHandle, id: &str) -> Result<(), String> {
+    with(app, |c| {
+        let n = c
+            .execute("DELETE FROM projects WHERE id = ?1", [id])
+            .map_err(|e| e.to_string())?;
+        if n == 0 {
+            return Err(format!("Unknown project: {id}"));
+        }
+        c.execute("UPDATE chats SET project_id = NULL WHERE project_id = ?1", [id])
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    })
+}
+
 // ---------- built-in provider connection status ----------
 
 pub fn status_get(app: &AppHandle, id: &str) -> (String, String) {
@@ -670,4 +922,240 @@ fn slug(name: &str) -> String {
         .collect();
     let s = s.trim_matches('-').to_string();
     if s.is_empty() { "provider".to_string() } else { s }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    /// A fresh in-memory database with the full v1.2.3 schema.
+    fn fresh() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        conn
+    }
+
+    /// Simulate a pre-1.2.3 database after `migrate()` ran: old chats table
+    /// without project_id, plus the projects table migrate() creates.
+    fn legacy() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            r#"
+            CREATE TABLE projects(
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                path TEXT NOT NULL UNIQUE COLLATE NOCASE,
+                sort INTEGER NOT NULL DEFAULT 0,
+                created_at INTEGER NOT NULL
+            );
+            CREATE TABLE chats(
+                id TEXT PRIMARY KEY,
+                title TEXT NOT NULL DEFAULT 'New chat',
+                workspace TEXT NOT NULL DEFAULT '',
+                provider TEXT NOT NULL DEFAULT '',
+                model TEXT NOT NULL DEFAULT '',
+                effort TEXT NOT NULL DEFAULT '',
+                permission_mode TEXT NOT NULL DEFAULT 'ask',
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+            INSERT INTO chats(id,workspace,created_at,updated_at)
+                VALUES('c1','C:\code\alpha', 1000, 2000),
+                      ('c2','C:\code\beta',  1001, 2001),
+                      ('c3','',                1002, 2002);
+            "#,
+        )
+        .unwrap();
+        conn
+    }
+
+    #[test]
+    fn migration_adds_project_column_and_preserves_sessions() {
+        let conn = legacy();
+        ensure_chat_project_column(&conn).unwrap();
+        // The column now exists and every legacy chat row survived untouched.
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM chats", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 3);
+        let titles: Vec<String> = {
+            let mut st = conn.prepare("SELECT title FROM chats ORDER BY id").unwrap();
+            st.query_map([], |r| r.get(0))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        assert_eq!(titles.len(), 3);
+        // Column is real: selecting it works and all values start as NULL.
+        let nulls: i64 = conn
+            .query_row("SELECT COUNT(*) FROM chats WHERE project_id IS NULL", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(nulls, 3);
+    }
+
+    #[test]
+    fn migration_is_idempotent() {
+        let conn = fresh();
+        ensure_chat_project_column(&conn).unwrap();
+        ensure_chat_project_column(&conn).unwrap(); // must not error
+    }
+
+    #[test]
+    fn seeding_creates_project_per_distinct_workspace() {
+        let conn = legacy();
+        ensure_chat_project_column(&conn).unwrap();
+        seed_projects(&conn, "C:\\code\\alpha").unwrap();
+        let projects = projects_list_conn(&conn).unwrap();
+        let mut paths: Vec<String> = projects.iter().map(|p| p.path.clone()).collect();
+        paths.sort();
+        assert_eq!(paths, vec!["C:\\code\\alpha", "C:\\code\\beta"]);
+        // Session names derive from the folder.
+        let alpha = projects.iter().find(|p| p.path == "C:\\code\\alpha").unwrap();
+        assert_eq!(alpha.name, "alpha");
+    }
+
+    #[test]
+    fn seeding_assigns_chats_to_matching_projects_and_default() {
+        let conn = legacy();
+        ensure_chat_project_column(&conn).unwrap();
+        seed_projects(&conn, "C:\\code\\alpha").unwrap();
+        let chats = chats_list_conn(&conn).unwrap();
+        let by_id = |id: &str| chats.iter().find(|c| c.id == id).unwrap();
+        // Matched by workspace path (case-insensitive fallback included).
+        assert_eq!(by_id("c1").project_id.as_deref().is_some(), true);
+        assert_eq!(by_id("c2").project_id.as_deref().is_some(), true);
+        // Empty workspace chat lands on the default project.
+        assert_eq!(by_id("c3").project_id.as_deref().is_some(), true);
+        let alpha = projects_list_conn(&conn)
+            .unwrap()
+            .into_iter()
+            .find(|p| p.path == "C:\\code\\alpha")
+            .unwrap();
+        assert_eq!(by_id("c1").project_id.as_deref(), Some(alpha.id.as_str()));
+        assert_eq!(by_id("c3").project_id.as_deref(), Some(alpha.id.as_str()));
+        assert_ne!(by_id("c1").project_id, by_id("c2").project_id);
+    }
+
+    #[test]
+    fn seeding_with_no_chats_creates_default_project_only() {
+        let conn = fresh();
+        seed_projects(&conn, "C:\\code\\default").unwrap();
+        let projects = projects_list_conn(&conn).unwrap();
+        assert_eq!(projects.len(), 1);
+        assert_eq!(projects[0].path, "C:\\code\\default");
+        assert_eq!(projects[0].name, "default");
+    }
+
+    #[test]
+    fn seeding_does_not_run_twice() {
+        let conn = fresh();
+        project_upsert_conn(&conn, "C:\\code\\existing", "existing").unwrap();
+        seed_projects(&conn, "C:\\code\\default").unwrap();
+        // Existing projects are never replaced by the default workspace.
+        let projects = projects_list_conn(&conn).unwrap();
+        assert_eq!(projects.len(), 1);
+        assert_eq!(projects[0].path, "C:\\code\\existing");
+    }
+
+    #[test]
+    fn project_upsert_dedupes_by_path_case_insensitively() {
+        let conn = fresh();
+        let a = project_upsert_conn(&conn, "C:\\code\\Alpha", "Alpha").unwrap();
+        // Same path with different casing returns the same project row.
+        let b = project_upsert_conn(&conn, "c:\\code\\alpha", "Whatever").unwrap();
+        assert_eq!(a.id, b.id);
+        let all = projects_list_conn(&conn).unwrap();
+        assert_eq!(all.len(), 1);
+    }
+
+    #[test]
+    fn project_upsert_rejects_empty_path() {
+        let conn = fresh();
+        assert!(project_upsert_conn(&conn, "  ", "x").is_err());
+    }
+
+    #[test]
+    fn chat_rows_roundtrip_project_id() {
+        let conn = fresh();
+        conn.execute_batch("INSERT INTO projects(id,name,path,sort,created_at) VALUES('p1','Alpha','C:\\a',0,1)").unwrap();
+        let chat = ChatSummary {
+            id: "ch1".into(),
+            title: "T".into(),
+            workspace: "C:\\a".into(),
+            provider: "groq".into(),
+            model: "m".into(),
+            effort: "".into(),
+            permission_mode: "ask".into(),
+            created_at: 1,
+            updated_at: 1,
+            project_id: Some("p1".into()),
+        };
+        conn.execute(
+            "INSERT INTO chats(id,title,workspace,provider,model,effort,permission_mode,created_at,updated_at,project_id)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+            rusqlite::params![
+                chat.id, chat.title, chat.workspace, chat.provider, chat.model, chat.effort,
+                chat.permission_mode, chat.created_at, chat.updated_at, chat.project_id
+            ],
+        )
+        .unwrap();
+        let got = chat_get_conn(&conn, "ch1").unwrap();
+        assert_eq!(got.project_id.as_deref(), Some("p1"));
+        assert_eq!(got.title, "T");
+    }
+
+    #[test]
+    fn removing_project_unlinks_but_keeps_its_sessions() {
+        let conn = fresh();
+        conn.execute_batch(
+            "INSERT INTO projects(id,name,path,sort,created_at) VALUES('p1','Alpha','C:\\a',0,1);
+             INSERT INTO chats(id,workspace,created_at,updated_at,project_id)
+                 VALUES('ch1','C:\\a',1,2,'p1');",
+        )
+        .unwrap();
+        conn.execute("DELETE FROM projects WHERE id = 'p1'", []).unwrap();
+        conn.execute("UPDATE chats SET project_id = NULL WHERE project_id = 'p1'", [])
+            .unwrap();
+        // The session survives with no project association.
+        let chats = chats_list_conn(&conn).unwrap();
+        assert_eq!(chats.len(), 1);
+        assert_eq!(chats[0].project_id, None);
+        // ...and can be re-seeded later by matching its workspace.
+        seed_projects(&conn, "C:\\a").unwrap();
+        let chats = chats_list_conn(&conn).unwrap();
+        assert!(chats[0].project_id.is_some());
+    }
+
+    #[test]
+    fn project_name_falls_back_to_folder_basename() {
+        let conn = fresh();
+        let p = project_upsert_conn(&conn, "C:\\code\\my-project", "").unwrap();
+        assert_eq!(p.name, "my-project");
+    }
+
+    #[test]
+    fn chat_summary_serializes_project_id() {
+        let c = ChatSummary {
+            id: "1".into(),
+            title: "t".into(),
+            workspace: "w".into(),
+            provider: "p".into(),
+            model: "m".into(),
+            effort: String::new(),
+            permission_mode: "ask".into(),
+            created_at: 0,
+            updated_at: 0,
+            project_id: None,
+        };
+        let v = serde_json::to_value(&c).unwrap();
+        assert!(v.get("projectId").unwrap().is_null());
+    }
+
+    // Sanity: Path-based basename extraction used by seeding.
+    #[test]
+    fn basename_extraction() {
+        let p = Path::new("C:\\code\\alpha");
+        assert_eq!(p.file_name().unwrap().to_string_lossy(), "alpha");
+    }
 }

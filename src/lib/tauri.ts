@@ -1,10 +1,12 @@
 import { invoke } from "@tauri-apps/api/core";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import type {
   Attachment,
   ChatCaps,
   ChatMessage,
   ChatSummary,
   ProcessInfo,
+  ProjectInfo,
   ProviderConfig,
   ProviderInfo,
   ProviderStatus,
@@ -22,8 +24,14 @@ export interface TreeNode {
 export const api = {
   // chats + messages
   listChats: () => invoke<ChatSummary[]>("list_chats"),
-  createChat: (p: { workspace: string; provider: string; model: string; effort: string; permissionMode: string }) =>
-    invoke<ChatSummary>("create_chat", p),
+  createChat: (p: {
+    workspace: string;
+    provider: string;
+    model: string;
+    effort: string;
+    permissionMode: string;
+    projectId?: string | null;
+  }) => invoke<ChatSummary>("create_chat", p),
   renameChat: (chatId: string, title: string) => invoke<void>("rename_chat", { chatId, title }),
   deleteChat: (chatId: string) => invoke<void>("delete_chat", { chatId }),
   updateChat: (chatId: string, patch: Record<string, unknown>) =>
@@ -32,6 +40,12 @@ export const api = {
   sendMessage: (chatId: string, text: string, attachments: Attachment[]) =>
     invoke<void>("send_message", { chatId, text, attachments }),
   cancelChat: (chatId: string) => invoke<void>("cancel_chat", { chatId }),
+
+  // projects
+  projectList: () => invoke<ProjectInfo[]>("project_list"),
+  projectAdd: (path: string, name?: string) => invoke<ProjectInfo>("project_add", { path, name: name ?? "" }),
+  projectRename: (projectId: string, name: string) => invoke<ProjectInfo>("project_rename", { projectId, name }),
+  projectRemove: (projectId: string) => invoke<void>("project_remove", { projectId }),
 
   // permissions + questions
   respondPermission: (id: string, allow: boolean, remember: boolean) =>
@@ -79,6 +93,23 @@ export const api = {
   openExternal: (target: string) => invoke<void>("open_external", { target }),
   listProcesses: () => invoke<ProcessInfo[]>("list_processes"),
   stopProcess: (id: number) => invoke<void>("stop_process", { id }),
+};
+
+/** True when running inside the Tauri desktop shell (not a plain browser). */
+export const isTauri =
+  typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+
+/** Window chrome actions for the custom title bar. Safe only under Tauri. */
+export const win = {
+  minimize: () => getCurrentWindow().minimize(),
+  toggleMaximize: () => getCurrentWindow().toggleMaximize(),
+  close: () => getCurrentWindow().close(),
+  isMaximized: () => getCurrentWindow().isMaximized(),
+  /** Subscribe to window resize events (used to track maximize state). */
+  onResized: (cb: () => void) =>
+    getCurrentWindow().onResized(() => {
+      cb();
+    }),
 };
 
 export const mimeForPath = (path: string): string => {
