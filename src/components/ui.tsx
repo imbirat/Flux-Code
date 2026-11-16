@@ -1,5 +1,7 @@
 import { useEffect, useRef, useState, type ReactNode } from "react";
+import { AnimatePresence, motion } from "motion/react";
 import { Loader2 } from "lucide-react";
+import { backdrop, baseTransition, fastTransition, menuPop, modalPanel } from "../lib/motion";
 
 export function FluxMark({ size = 20 }: { size?: number }) {
   return (
@@ -52,15 +54,20 @@ export function Menu({
   return (
     <div className="relative" ref={ref}>
       <div onClick={() => setOpen((o) => !o)}>{trigger}</div>
-      {open && (
-        <div
-          className={`absolute ${pos} z-50 overflow-hidden rounded-xl border border-line bg-raised py-1 shadow-[0_12px_32px_rgba(0,0,0,0.45)]`}
-          style={{ width }}
-          onClick={() => setOpen(false)}
-        >
-          {children}
-        </div>
-      )}
+      <AnimatePresence>
+        {open && (
+          <motion.div
+            initial={menuPop(direction).initial}
+            animate={menuPop(direction).animate}
+            exit={menuPop(direction).exit}
+            className={`absolute ${pos} z-50 origin-bottom overflow-hidden rounded-xl border border-line bg-raised py-1 shadow-[0_12px_32px_rgba(0,0,0,0.45)]`}
+            style={{ width }}
+            onClick={() => setOpen(false)}
+          >
+            {children}
+          </motion.div>
+        )}
+      </AnimatePresence>
     </div>
   );
 }
@@ -115,18 +122,34 @@ export function Modal({
     document.addEventListener("keydown", onKey);
     return () => document.removeEventListener("keydown", onKey);
   }, [open, onClose]);
-  if (!open) return null;
   return (
-    <div className="fixed inset-0 z-[100] flex items-center justify-center p-6">
-      <div className="absolute inset-0 bg-black/55" onClick={onClose} />
-      <div
-        className={`relative flex max-h-[88vh] flex-col overflow-hidden rounded-2xl border border-line bg-panel shadow-[0_24px_64px_rgba(0,0,0,0.5)] ${
-          wide ? "w-[880px] max-w-[94vw]" : "w-[480px] max-w-[94vw]"
-        }`}
-      >
-        {children}
-      </div>
-    </div>
+    <AnimatePresence>
+      {open && (
+        <div className="fixed inset-0 z-[100] flex items-center justify-center p-6">
+          <motion.div
+            variants={backdrop}
+            initial="initial"
+            animate="animate"
+            exit="exit"
+            transition={baseTransition}
+            className="absolute inset-0 bg-black/55"
+            onClick={onClose}
+          />
+          <motion.div
+            variants={modalPanel}
+            initial="initial"
+            animate="animate"
+            exit="exit"
+            transition={baseTransition}
+            className={`relative flex max-h-[88vh] flex-col overflow-hidden rounded-2xl border border-line bg-panel shadow-[0_24px_64px_rgba(0,0,0,0.5)] ${
+              wide ? "w-[880px] max-w-[94vw]" : "w-[480px] max-w-[94vw]"
+            }`}
+          >
+            {children}
+          </motion.div>
+        </div>
+      )}
+    </AnimatePresence>
   );
 }
 
@@ -144,7 +167,9 @@ export function IconButton({
   className?: string;
 }) {
   return (
-    <button
+    <motion.button
+      whileTap={{ scale: 0.92 }}
+      transition={fastTransition}
       title={title}
       onClick={onClick}
       className={`flex h-7 w-7 items-center justify-center rounded-lg text-dim transition-colors hover:bg-hover hover:text-ink ${
@@ -152,7 +177,7 @@ export function IconButton({
       } ${className}`}
     >
       {children}
-    </button>
+    </motion.button>
   );
 }
 
@@ -160,7 +185,7 @@ export function Tip({ text, children }: { text: string; children: ReactNode }) {
   return (
     <span className="group/tip relative inline-flex">
       {children}
-      <span className="pointer-events-none absolute bottom-full left-1/2 z-[60] mb-1.5 -translate-x-1/2 whitespace-nowrap rounded-md border border-line bg-raised px-2 py-1 font-mono text-[10.5px] text-dim opacity-0 transition-opacity group-hover/tip:opacity-100">
+      <span className="pointer-events-none absolute bottom-full left-1/2 z-[60] mb-1.5 -translate-x-1/2 whitespace-nowrap rounded-md border border-line bg-raised px-2 py-1 font-mono text-[10.5px] text-dim opacity-0 shadow-[0_4px_12px_rgba(0,0,0,0.35)] transition-[opacity,transform] duration-150 ease-out group-hover/tip:delay-150 group-hover/tip:opacity-100 group-hover/tip:-translate-y-0.5">
         {text}
       </span>
     </span>

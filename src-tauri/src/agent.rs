@@ -31,21 +31,23 @@ fn ev(app: &AppHandle, event: &str, payload: Value) {
 }
 
 pub fn provider_ctx(app: &AppHandle, provider_id: &str, model: &str) -> Result<ProviderCtx, String> {
-    let config = db::provider_config_get(app, provider_id);
+    let resolved = providers::resolve(app, provider_id)?;
     let key = creds::get_key(provider_id)?.unwrap_or_default();
-    if provider_id != "custom" && key.is_empty() {
-        return Err(format!("No API key configured for {provider_id} — add one in Settings › Providers"));
+    if key.is_empty() {
+        return Err(format!(
+            "No API key configured for {provider_id} — add one in Settings › Providers"
+        ));
     }
-    if provider_id == "custom" && providers::base_url_for(provider_id, &config).is_empty() {
-        return Err("Custom provider has no base URL — configure it in Settings › Providers".into());
+    if resolved.base_url.is_empty() {
+        return Err("This provider has no base URL — configure it in Settings › Providers".into());
     }
     Ok(ProviderCtx {
         provider_id: provider_id.into(),
-        format: providers::format_for(provider_id, &config),
-        base_url: providers::base_url_for(provider_id, &config),
+        format: resolved.format,
+        base_url: resolved.base_url,
         api_key: key,
         model: model.into(),
-        extra_headers: providers::extra_headers_for(provider_id, &config),
+        extra_headers: resolved.extra_headers,
     })
 }
 

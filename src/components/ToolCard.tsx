@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { AnimatePresence, motion } from "motion/react";
 import {
   ChevronDown,
   ChevronRight,
@@ -19,6 +20,7 @@ import type { DiffRow, MessageMeta } from "../lib/types";
 import { Markdown } from "./Markdown";
 import { Spinner } from "./ui";
 import { useStore } from "../lib/store";
+import { EASE } from "../lib/motion";
 
 const TOOL_ICONS: Record<string, any> = {
   list_files: List,
@@ -79,7 +81,11 @@ function OutputBlock({ text, label }: { text: string; label?: string }) {
   const shown = collapsed ? lines.slice(0, 12).join("\n") : text;
   return (
     <div className="mt-1 overflow-hidden rounded-lg border border-line bg-bg">
-      <pre className="max-h-72 overflow-auto px-3 py-2 font-mono text-[11.5px] leading-relaxed text-dim whitespace-pre-wrap">
+      <pre
+        className={`max-h-72 overflow-auto px-3 py-2 font-mono text-[11.5px] leading-relaxed text-dim whitespace-pre-wrap ${
+          collapsed ? "[mask-image:linear-gradient(to_bottom,black_55%,transparent)]" : ""
+        }`}
+      >
         {shown}
       </pre>
       {lines.length > 12 && (
@@ -87,12 +93,31 @@ function OutputBlock({ text, label }: { text: string; label?: string }) {
           onClick={() => setOpen((o) => !o)}
           className="flex w-full items-center gap-1.5 border-t border-line px-3 py-1 font-mono text-[10.5px] text-faint transition-colors hover:text-dim"
         >
-          {open ? <ChevronDown size={11} /> : <ChevronRight size={11} />}
+          <ChevronDown size={11} className={`transition-transform duration-150 ${open ? "" : "-rotate-90"}`} />
           {open ? "Hide" : `Show all ${lines.length} lines`}
           {label && <span className="ml-auto">{label}</span>}
         </button>
       )}
     </div>
+  );
+}
+
+/** Expandable body used for diff/output sections inside a tool card. */
+function Reveal({ open, children }: { open: boolean; children: React.ReactNode }) {
+  return (
+    <AnimatePresence initial={false}>
+      {open && (
+        <motion.div
+          initial={{ height: 0, opacity: 0 }}
+          animate={{ height: "auto", opacity: 1 }}
+          exit={{ height: 0, opacity: 0 }}
+          transition={{ duration: 0.18, ease: EASE }}
+          className="overflow-hidden"
+        >
+          {children}
+        </motion.div>
+      )}
+    </AnimatePresence>
   );
 }
 
@@ -130,6 +155,7 @@ export function ToolCard({
   meta?: MessageMeta;
 }) {
   const t = useStore((s) => s.t);
+  const [expanded, setExpanded] = useState(false);
   const Icon = TOOL_ICONS[name] ?? List;
   const title = TOOL_TITLES[name] ?? name;
   const target: string =
@@ -144,16 +170,41 @@ export function ToolCard({
     state === "running" ? (
       <Spinner />
     ) : state === "done" ? (
-      <CheckIcon size={12} className="text-faint" />
+      <motion.span
+        initial={{ scale: 0.5, opacity: 0 }}
+        animate={{ scale: 1, opacity: 1 }}
+        transition={{ duration: 0.16, ease: EASE }}
+        className="flex"
+      >
+        <CheckIcon size={12} className="text-faint" />
+      </motion.span>
     ) : state === "denied" ? (
       <span className="font-mono text-[10px] text-warn">{t("chat.denied")}</span>
     ) : state === "error" ? (
       <XIcon size={12} className="text-err" />
     ) : null;
 
+  // Anything worth inspecting gets an expandable body.
+  const hasBody =
+    (name === "edit_file" || name === "create_file" || name === "run_command" ||
+      name === "read_file" || name === "list_files" || name === "search_files" ||
+      name === "rename_file" || name === "delete_file" || name === "create_folder") &&
+    (meta?.diff || meta?.command || meta?.output || result);
+
   return (
     <div className="my-1.5 overflow-hidden rounded-xl border border-line bg-raised">
-      <div className="flex h-8 items-center gap-2 border-b border-line px-3">
+      <button
+        onClick={() => hasBody && setExpanded((e) => !e)}
+        className={`flex h-8 w-full items-center gap-2 border-b border-line px-3 text-left ${
+          hasBody ? "cursor-pointer transition-colors hover:bg-hover/50" : "cursor-default"
+        }`}
+      >
+        {hasBody && (
+          <ChevronRight
+            size={12}
+            className={`flex-none text-faint transition-transform duration-150 ${expanded ? "rotate-90" : ""}`}
+          />
+        )}
         <Icon size={13} className="shrink-0 text-faint" />
         <span className="text-[12px] text-dim">{title}</span>
         {shortTarget && (
@@ -161,7 +212,7 @@ export function ToolCard({
         )}
         {!shortTarget && <span className="flex-1" />}
         {stateChip}
-      </div>
+      </button>
       <div className="px-3 py-2">
         {(name === "edit_file" || name === "create_file") && meta?.diff && meta.diff.length > 0 && (
           <DiffView rows={meta.diff} />
@@ -176,21 +227,23 @@ export function ToolCard({
             )}
           </>
         )}
-        {(name === "read_file" || name === "list_files" || name === "search_files") && result && (
-          <OutputBlock text={result} />
-        )}
-        {name === "ask_user" && meta?.card && (
-          <ReadOnlyQuestion questions={meta.card.questions ?? []} answers={meta.card.answers} />
-        )}
-        {(name === "start_process" || name === "stop_process" || name === "list_processes") && result && !meta?.command && (
-          <div className="font-mono text-[11px] leading-relaxed text-faint whitespace-pre-wrap">{result.length > 400 ? result.slice(0, 400) + "…" : result}</div>
-        )}
-        {state === "error" && result && !meta?.command && (
-          <div className="font-mono text-[11px] leading-relaxed text-err whitespace-pre-wrap">{result}</div>
-        )}
-        {state === "denied" && result && !meta?.command && (
-          <div className="text-[11.5px] text-faint">{result}</div>
-        )}
+        <Reveal open={expanded}>
+          {(name === "read_file" || name === "list_files" || name === "search_files") && result && (
+            <OutputBlock text={result} />
+          )}
+          {name === "ask_user" && meta?.card && (
+            <ReadOnlyQuestion questions={meta.card.questions ?? []} answers={meta.card.answers} />
+          )}
+          {(name === "start_process" || name === "stop_process" || name === "list_processes") && result && !meta?.command && (
+            <div className="font-mono text-[11px] leading-relaxed text-faint whitespace-pre-wrap">{result.length > 400 ? result.slice(0, 400) + "…" : result}</div>
+          )}
+          {state === "error" && result && !meta?.command && (
+            <div className="font-mono text-[11px] leading-relaxed text-err whitespace-pre-wrap">{result}</div>
+          )}
+          {state === "denied" && result && !meta?.command && (
+            <div className="text-[11.5px] text-faint">{result}</div>
+          )}
+        </Reveal>
       </div>
     </div>
   );

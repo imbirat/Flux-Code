@@ -1,5 +1,7 @@
+import { motion } from "motion/react";
 import { ShieldAlert } from "lucide-react";
 import { useStore } from "../lib/store";
+import { EASE } from "../lib/motion";
 
 export default function PermissionCard() {
   const t = useStore((s) => s.t);
@@ -10,7 +12,12 @@ export default function PermissionCard() {
   const isCommand = permission.detail?.kind === "command";
 
   return (
-    <div className="mx-auto my-2 w-full max-w-3xl px-4">
+    <motion.div
+      initial={{ opacity: 0, y: 10, scale: 0.99 }}
+      animate={{ opacity: 1, y: 0, scale: 1 }}
+      transition={{ duration: 0.22, ease: EASE }}
+      className="mx-auto my-2 w-full max-w-3xl px-4"
+    >
       <div className="overflow-hidden rounded-xl border border-line2 bg-raised shadow-[0_8px_28px_rgba(0,0,0,0.35)]">
         <div className="flex items-center gap-2 border-b border-line px-4 py-2.5">
           <ShieldAlert size={14} className="text-warn" />
@@ -55,6 +62,6 @@ export default function PermissionCard() {
           </button>
         </div>
       </div>
-    </div>
+    </motion.div>
   );
 }

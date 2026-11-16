@@ -44,6 +44,8 @@ pub fn run() {
             commands::provider_list_models,
             commands::provider_get_config,
             commands::provider_set_config,
+            commands::custom_provider_save,
+            commands::custom_provider_delete,
             commands::model_capabilities,
             // workspace + files
             commands::list_dir_tree,
@@ -57,6 +59,10 @@ pub fn run() {
         .setup(|app| {
             let handle = app.handle().clone();
             db::init(&handle)?;
+            // One-time migration of the legacy single "custom" provider row.
+            if let Err(e) = db::migrate_legacy_custom(&handle) {
+                eprintln!("custom provider migration failed: {e}");
+            }
             app.manage(agent::Agents(Default::default()));
             app.manage(agent::Pending(Default::default()));
             app.manage(agent::SessionAllow(Default::default()));

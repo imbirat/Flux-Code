@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { AnimatePresence, motion } from "motion/react";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import {
@@ -17,6 +18,7 @@ import {
 } from "lucide-react";
 import { useStore } from "../lib/store";
 import { api, mimeForPath } from "../lib/tauri";
+import { listItem } from "../lib/motion";
 import type { Attachment } from "../lib/types";
 import { IconButton, Menu, MenuDivider, MenuItem, Tip } from "./ui";
 
@@ -138,7 +140,42 @@ export default function Composer() {
     }
   };
 
-  const canSend = (text.trim().length > 0 || attachments.length > 0) && !!(chat?.provider && chat?.model);
+  // Only models the user explicitly enabled appear in the picker.
+  const modelOptions = useMemo(() => {
+    const out: { provider: string; label: string; model: string }[] = [];
+    for (const p of providers) {
+      const models = (p.config.enabledModels as string[] | undefined) ?? [];
+      for (const m of models) out.push({ provider: p.id, label: p.label, model: m });
+    }
+    return out;
+  }, [providers]);
+
+  const groupedOptions = useMemo(() => {
+    const groups: { label: string; items: typeof modelOptions }[] = [];
+    for (const o of modelOptions) {
+      let g = groups.find((x) => x.label === o.label);
+      if (!g) {
+        g = { label: o.label, items: [] };
+        groups.push(g);
+      }
+      g.items.push(o);
+    }
+    return groups;
+  }, [modelOptions]);
+
+  const modelMissing = !!chat && (!chat.provider || !chat.model) && modelOptions.length > 0;
+  // The chat's selected model must still be enabled on its provider.
+  const modelUnavailable =
+    !!chat &&
+    providers.length > 0 &&
+    !!chat.provider &&
+    !!chat.model &&
+    !modelOptions.some((o) => o.provider === chat.provider && o.model === chat.model);
+
+  const canSend =
+    (text.trim().length > 0 || attachments.length > 0) &&
+    !!(chat?.provider && chat?.model) &&
+    !modelUnavailable;
   const isStreaming = !!streaming || !!status;
 
   const doSend = () => {
@@ -150,18 +187,6 @@ export default function Composer() {
     taRef.current?.focus();
   };
 
-  const modelOptions = useMemo(() => {
-    const out: { provider: string; label: string; model: string }[] = [];
-    for (const p of providers) {
-      if (!p.connected) continue;
-      const models = (p.config.enabledModels as string[] | undefined) ?? (p.config.defaultModel ? [p.config.defaultModel as string] : []);
-      for (const m of models) out.push({ provider: p.id, label: p.label, model: m });
-    }
-    return out;
-  }, [providers]);
-
-  const modelMissing = !!chat && (!chat.provider || !chat.model) && modelOptions.length > 0;
-
   return (
     <div className="flex-none px-4 pb-4">
       <div className="mx-auto w-full max-w-3xl">
@@ -172,21 +197,46 @@ export default function Composer() {
         >
           {attachments.length > 0 && (
             <div className="flex flex-wrap gap-1.5 border-b border-line px-3 pb-2 pt-2.5">
-              {attachments.map((a, i) => (
-                <span
-                  key={i}
-                  className="group flex h-7 max-w-56 items-center gap-1.5 rounded-lg border border-line bg-raised px-2 text-[11.5px] text-dim"
-                >
-                  {a.kind === "image" ? <ImageIcon size={12} className="shrink-0 text-faint" /> : <FileCode2 size={12} className="shrink-0 text-faint" />}
-                  <span className="truncate">{a.name}</span>
-                  <button
-                    onClick={() => setAttachments((prev) => prev.filter((_, j) => j !== i))}
-                    className="ml-0.5 text-faint opacity-0 transition-opacity group-hover:opacity-100 hover:text-ink"
+              <AnimatePresence initial={false}>
+                {attachments.map((a, i) => (
+                  <motion.span
+                    key={`${a.path}-${i}`}
+                    layout
+                    variants={listItem}
+                    initial="initial"
+                    animate="animate"
+                    exit="exit"
+                    className="group flex h-7 max-w-56 items-center gap-1.5 rounded-lg border border-line bg-raised px-2 text-[11.5px] text-dim"
                   >
-                    ×
-                  </button>
-                </span>
-              ))}
+                    {a.kind === "image" ? <ImageIcon size={12} className="shrink-0 text-faint" /> : <FileCode2 size={12} className="shrink-0 text-faint" />}
+                    <span className="truncate">{a.name}</span>
+                    <button
+                      onClick={() => setAttachments((prev) => prev.filter((_, j) => j !== i))}
+                      className="ml-0.5 text-faint opacity-0 transition-opacity group-hover:opacity-100 hover:text-ink"
+                    >
+                      ×
+                    </button>
+                  </motion.span>
+                ))}
+              </AnimatePresence>
+            </div>
+          )}
+
+          {modelUnavailable && (
+            <div className="flex items-center gap-2 border-b border-err/30 bg-err/10 px-3 py-1.5">
+              <span className="h-1.5 w-1.5 flex-none rounded-full bg-err" />
+              <span className="min-w-0 flex-1 truncate text-[11.5px] text-err">
+                {t("composer.model.unavailable")}
+              </span>
+              <button
+                onClick={() => {
+                  const btn = document.querySelector<HTMLButtonElement>("[data-model-menu]");
+                  btn?.click();
+                }}
+                className="flex-none text-[11.5px] text-err underline decoration-err/40 underline-offset-2 hover:decoration-err"
+              >
+                {t("composer.model")}
+              </button>
             </div>
           )}
 
@@ -302,7 +352,7 @@ export default function Composer() {
                   align="right"
                   trigger={
                     <Tip text={t("composer.model")}>
-                      <button className="flex h-7 items-center gap-1.5 rounded-lg px-2 text-[12px] text-dim transition-colors hover:bg-hover hover:text-ink">
+                      <button data-model-menu className="flex h-7 items-center gap-1.5 rounded-lg px-2 text-[12px] text-dim transition-colors hover:bg-hover hover:text-ink">
                         <Zap size={14} />
                         <span className="max-w-44 truncate font-mono text-[11px]">{activeModel || t("composer.model")}</span>
                       </button>
@@ -312,18 +362,20 @@ export default function Composer() {
                   {modelOptions.length === 0 && (
                     <MenuItem icon={<Plus size={14} />} label={t("composer.noModel")} onClick={() => setSettingsOpen(true)} />
                   )}
-                  {modelOptions.map((o) => (
-                    <MenuItem
-                      key={`${o.provider}|${o.model}`}
-                      label={
-                        <span className="flex items-baseline gap-2">
-                          <span className="truncate">{o.model}</span>
-                          <span className="text-[10px] text-faint">{o.label}</span>
-                        </span>
-                      }
-                      active={o.provider === activeProvider && o.model === activeModel}
-                      onClick={() => selectModel(o.provider, o.model).catch(() => {})}
-                    />
+                  {groupedOptions.map((g) => (
+                    <div key={g.label}>
+                      <div className="px-3 pb-0.5 pt-1.5 text-[10px] uppercase tracking-wider text-faint">
+                        {g.label}
+                      </div>
+                      {g.items.map((o) => (
+                        <MenuItem
+                          key={`${o.provider}|${o.model}`}
+                          label={o.model}
+                          active={o.provider === activeProvider && o.model === activeModel}
+                          onClick={() => selectModel(o.provider, o.model).catch(() => {})}
+                        />
+                      ))}
+                    </div>
                   ))}
                   {modelOptions.length > 0 && (
                     <>
@@ -337,24 +389,26 @@ export default function Composer() {
 
             {isStreaming ? (
               <Tip text={t("composer.stop")}>
-                <button
+                <motion.button
+                  whileTap={{ scale: 0.92 }}
                   onClick={() => stop().catch(() => {})}
                   className="ml-1 flex h-8 w-8 items-center justify-center rounded-xl border border-line text-dim transition-colors hover:bg-hover hover:text-ink"
                   title={t("composer.stop")}
                 >
                   <Square size={13} />
-                </button>
+                </motion.button>
               </Tip>
             ) : (
               <Tip text={t("composer.send")}>
-                <button
+                <motion.button
+                  whileTap={{ scale: 0.92 }}
                   onClick={doSend}
                   disabled={!canSend}
                   title={t("composer.send")}
                   className="ml-1 flex h-8 w-8 items-center justify-center rounded-xl bg-ink text-bg transition-opacity enabled:hover:opacity-85 disabled:opacity-25"
                 >
                   <ArrowUp size={15} />
-                </button>
+                </motion.button>
               </Tip>
             )}
           </div>

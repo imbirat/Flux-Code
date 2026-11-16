@@ -1,5 +1,6 @@
 import { useEffect } from "react";
 import { listen } from "@tauri-apps/api/event";
+import { MotionConfig, motion } from "motion/react";
 import { useStore } from "./lib/store";
 import Sidebar from "./components/Sidebar";
 import ChatView from "./components/ChatView";
@@ -35,7 +36,13 @@ function resolveTheme(theme: string): "dark" | "light" {
 function Splash() {
   return (
     <div className="flex h-full flex-col items-center justify-center bg-bg">
-      <FluxMark size={36} />
+      <motion.div
+        initial={{ opacity: 0, scale: 0.96 }}
+        animate={{ opacity: 1, scale: 1 }}
+        transition={{ duration: 0.3, ease: [0.25, 0.8, 0.25, 1] }}
+      >
+        <FluxMark size={36} />
+      </motion.div>
     </div>
   );
 }
@@ -111,16 +118,18 @@ export default function App() {
   if (!booted) return <Splash />;
 
   return (
-    <div className="flex h-full overflow-hidden bg-bg text-ink">
-      <Sidebar />
-      <main className="flex min-w-0 flex-1 flex-col">
-        <ChatView />
-        <PermissionCard />
-        <QuestionCard />
-        <Composer />
-      </main>
-      <RightPanel />
-      <Settings />
-    </div>
+    <MotionConfig reducedMotion={settings.reducedMotion ? "always" : "user"}>
+      <div className="flex h-full overflow-hidden bg-bg text-ink">
+        <Sidebar />
+        <main className="flex min-w-0 flex-1 flex-col">
+          <ChatView />
+          <PermissionCard />
+          <QuestionCard />
+          <Composer />
+        </main>
+        <RightPanel />
+        <Settings />
+      </div>
+    </MotionConfig>
   );
 }

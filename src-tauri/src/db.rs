@@ -1,6 +1,6 @@
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::sync::Mutex;
 use tauri::{AppHandle, Manager};
 
@@ -97,6 +97,27 @@ fn migrate(conn: &Connection) -> Result<(), String> {
         );
         CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS providers(id TEXT PRIMARY KEY, config TEXT NOT NULL DEFAULT '{}');
+        CREATE TABLE IF NOT EXISTS custom_providers(
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            base_url TEXT NOT NULL DEFAULT '',
+            format TEXT NOT NULL DEFAULT 'openai',
+            headers TEXT NOT NULL DEFAULT '{}',
+            models_path TEXT NOT NULL DEFAULT '',
+            manual_models TEXT NOT NULL DEFAULT '[]',
+            enabled_models TEXT NOT NULL DEFAULT '[]',
+            default_model TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'untested',
+            message TEXT NOT NULL DEFAULT '',
+            sort INTEGER NOT NULL DEFAULT 0,
+            created_at INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS provider_status(
+            provider_id TEXT PRIMARY KEY,
+            status TEXT NOT NULL DEFAULT 'untested',
+            message TEXT NOT NULL DEFAULT '',
+            checked_at INTEGER NOT NULL DEFAULT 0
+        );
         "#,
     )
     .map_err(|e| e.to_string())
@@ -395,4 +416,258 @@ pub fn provider_config_set(app: &AppHandle, id: &str, config: &Value) -> Result<
         .map_err(|e| e.to_string())?;
         Ok(())
     })
+}
+
+// ---------- custom providers ----------
+
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct CustomProvider {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub base_url: String,
+    #[serde(default = "default_format")]
+    pub format: String,
+    #[serde(default)]
+    pub headers: Value,
+    #[serde(default)]
+    pub models_path: String,
+    #[serde(default)]
+    pub manual_models: Vec<String>,
+    #[serde(default)]
+    pub enabled_models: Vec<String>,
+    #[serde(default)]
+    pub default_model: String,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub message: String,
+    #[serde(default)]
+    pub sort: i64,
+}
+
+fn default_format() -> String {
+    "openai".into()
+}
+
+const CUSTOM_COLS: &str = "id,name,base_url,format,headers,models_path,manual_models,enabled_models,default_model,status,message,sort";
+
+fn row_to_custom(r: &rusqlite::Row) -> rusqlite::Result<CustomProvider> {
+    let headers: String = r.get(4)?;
+    let manual: String = r.get(6)?;
+    let enabled: String = r.get(7)?;
+    Ok(CustomProvider {
+        id: r.get(0)?,
+        name: r.get(1)?,
+        base_url: r.get(2)?,
+        format: r.get(3)?,
+        headers: serde_json::from_str(&headers).unwrap_or_else(|_| json!({})),
+        models_path: r.get(5)?,
+        manual_models: serde_json::from_str(&manual).unwrap_or_default(),
+        enabled_models: serde_json::from_str(&enabled).unwrap_or_default(),
+        default_model: r.get(8)?,
+        status: r.get(9)?,
+        message: r.get(10)?,
+        sort: r.get(11)?,
+    })
+}
+
+pub fn custom_list(app: &AppHandle) -> Result<Vec<CustomProvider>, String> {
+    with(app, |c| {
+        let sql = format!("SELECT {CUSTOM_COLS} FROM custom_providers ORDER BY sort, created_at");
+        let mut st = c.prepare(&sql).map_err(|e| e.to_string())?;
+        let rows = st
+            .query_map([], row_to_custom)
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
+        Ok(rows)
+    })
+}
+
+pub fn custom_get(app: &AppHandle, id: &str) -> Result<CustomProvider, String> {
+    with(app, |c| {
+        let sql = format!("SELECT {CUSTOM_COLS} FROM custom_providers WHERE id = ?1");
+        let mut st = c.prepare(&sql).map_err(|e| e.to_string())?;
+        st.query_row([id], row_to_custom)
+            .map_err(|e| format!("custom provider not found: {e}"))
+    })
+}
+
+pub fn custom_insert(app: &AppHandle, p: &CustomProvider) -> Result<(), String> {
+    let headers = serde_json::to_string(&p.headers).map_err(|e| e.to_string())?;
+    let manual = serde_json::to_string(&p.manual_models).map_err(|e| e.to_string())?;
+    let enabled = serde_json::to_string(&p.enabled_models).map_err(|e| e.to_string())?;
+    with(app, |c| {
+        c.execute(
+            "INSERT INTO custom_providers(id,name,base_url,format,headers,models_path,manual_models,enabled_models,default_model,status,message,sort,created_at)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+            rusqlite::params![
+                p.id, p.name, p.base_url, p.format, headers, p.models_path, manual, enabled,
+                p.default_model, p.status, p.message, p.sort, now_ms()
+            ],
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(())
+    })
+}
+
+pub fn custom_update(app: &AppHandle, p: &CustomProvider) -> Result<(), String> {
+    let headers = serde_json::to_string(&p.headers).map_err(|e| e.to_string())?;
+    let manual = serde_json::to_string(&p.manual_models).map_err(|e| e.to_string())?;
+    let enabled = serde_json::to_string(&p.enabled_models).map_err(|e| e.to_string())?;
+    with(app, |c| {
+        c.execute(
+            "UPDATE custom_providers SET name=?2, base_url=?3, format=?4, headers=?5, models_path=?6,
+             manual_models=?7, enabled_models=?8, default_model=?9, status=?10, message=?11 WHERE id=?1",
+            rusqlite::params![
+                p.id, p.name, p.base_url, p.format, headers, p.models_path, manual, enabled,
+                p.default_model, p.status, p.message
+            ],
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(())
+    })
+}
+
+pub fn custom_delete(app: &AppHandle, id: &str) -> Result<(), String> {
+    with(app, |c| {
+        c.execute("DELETE FROM custom_providers WHERE id = ?1", [id])
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    })
+}
+
+/// Persist a connection status for a custom provider (status without the key).
+pub fn custom_status_set(app: &AppHandle, id: &str, status: &str, message: &str) -> Result<(), String> {
+    with(app, |c| {
+        c.execute(
+            "UPDATE custom_providers SET status = ?2, message = ?3 WHERE id = ?1",
+            rusqlite::params![id, status, message],
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(())
+    })
+}
+
+// ---------- built-in provider connection status ----------
+
+pub fn status_get(app: &AppHandle, id: &str) -> (String, String) {
+    with(app, |c| {
+        let mut st = c
+            .prepare("SELECT status, message FROM provider_status WHERE provider_id = ?1")
+            .map_err(|e| e.to_string())?;
+        let (s, m): (String, String) = st
+            .query_row([id], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap_or_else(|_| ("untested".into(), "".into()));
+        Ok((s, m))
+    })
+    .unwrap_or(("untested".into(), "".into()))
+}
+
+pub fn status_set(app: &AppHandle, id: &str, status: &str, message: &str) -> Result<(), String> {
+    with(app, |c| {
+        c.execute(
+            "INSERT INTO provider_status(provider_id,status,message,checked_at) VALUES(?1,?2,?3,?4)
+             ON CONFLICT(provider_id) DO UPDATE SET status=?2, message=?3, checked_at=?4",
+            rusqlite::params![id, status, message, now_ms()],
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(())
+    })
+}
+
+/// One-time migration of the legacy single "custom" provider row (config JSON
+/// with a nested `custom` object) into the `custom_providers` table. The API
+/// key stored under the legacy credential account is copied to the new id.
+pub fn migrate_legacy_custom(app: &AppHandle) -> Result<(), String> {
+    let config = provider_config_get(app, "custom");
+    if config.is_null() {
+        return Ok(());
+    }
+    let nested = config.get("custom");
+    let name = nested
+        .and_then(|c| c.get("name"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let base = nested
+        .and_then(|c| c.get("baseUrl"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let format = nested
+        .and_then(|c| c.get("format"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("openai")
+        .to_string();
+    let headers = nested
+        .and_then(|c| c.get("headers"))
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let enabled: Vec<String> = config
+        .get("enabledModels")
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+        .unwrap_or_default();
+    let default_model = config
+        .get("defaultModel")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    // Only migrate when something meaningful was configured.
+    if name.is_empty() && base.is_empty() && enabled.is_empty() {
+        return Ok(());
+    }
+
+    let name = if name.is_empty() { "Custom".to_string() } else { name };
+    let existing = custom_list(app)?;
+    let ids: Vec<String> = existing.iter().map(|p| p.id.clone()).collect();
+    let id = crate::providers::unique_custom_id(&slug(&name), &ids);
+
+    let p = CustomProvider {
+        id: id.clone(),
+        name,
+        base_url: base,
+        format,
+        headers,
+        models_path: String::new(),
+        manual_models: vec![],
+        enabled_models: enabled,
+        default_model,
+        status: "untested".into(),
+        message: String::new(),
+        sort: existing.len() as i64,
+    };
+    custom_insert(app, &p)?;
+
+    // Copy the credential from the legacy account to the new provider id so
+    // the migrated provider keeps working without re-entering the key.
+    if let Ok(Some(key)) = crate::creds::get_key("custom") {
+        if !key.is_empty() {
+            let _ = crate::creds::set_key(&id, &key);
+            let _ = crate::creds::delete_key("custom");
+        }
+    }
+
+    // Drop the legacy row so this migration runs only once.
+    with(app, |c| {
+        c.execute("DELETE FROM providers WHERE id = 'custom'", [])
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    })
+}
+
+fn slug(name: &str) -> String {
+    let s: String = name
+        .to_lowercase()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    let s = s.trim_matches('-').to_string();
+    if s.is_empty() { "provider".to_string() } else { s }
 }

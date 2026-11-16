@@ -167,6 +167,17 @@ pub fn effort_values(provider_id: &str, model: &str) -> Option<Vec<String>> {
                 None
             }
         }
+        // Groq runs open reasoning models (qwen3, gpt-oss, qwq, deepseek-r1…)
+        // that accept the OpenAI reasoning_effort parameter.
+        "groq" => {
+            let hints = ["qwq", "qwen3", "gpt-oss", "deepseek-r1", "reasoning"];
+            if hints.iter().any(|h| m.contains(h)) {
+                supported(&["low", "medium", "high"])
+            } else {
+                None
+            }
+        }
+        // Custom providers are never assumed to support reasoning effort.
         _ => None,
     }
 }

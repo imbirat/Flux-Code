@@ -1,10 +1,12 @@
 import { useLayoutEffect, useRef, useState } from "react";
+import { motion, AnimatePresence } from "motion/react";
 import { ArrowDown, X } from "lucide-react";
 import { useStore } from "../lib/store";
+import { EASE, fadeRise, baseTransition } from "../lib/motion";
 import type { Attachment, ChatMessage } from "../lib/types";
 import { Markdown } from "./Markdown";
 import { ToolCard } from "./ToolCard";
-import { FluxMark, Spinner, Tip } from "./ui";
+import { FluxMark, Tip } from "./ui";
 
 const STATUS_LABEL: Record<string, string> = {
   thinking: "status.thinking",
@@ -157,66 +159,129 @@ export default function ChatView() {
         {!hasContent ? (
           <div className="flex h-full flex-col items-center justify-center px-6 pb-24">
             <FluxMark size={40} />
-            <h1 className="mt-5 text-[17px] font-semibold tracking-tight">
-              {t("chat.empty.title")}
-            </h1>
-            <p className="mt-2 max-w-sm text-center text-[13px] text-dim">{t("chat.empty.hint")}</p>
+            <h1 className="mt-5 text-[17px] font-semibold tracking-tight">{t("chat.empty.title")}</h1>
+            <p className="mt-2 max-w-sm text-center text-[13px] leading-relaxed text-dim">
+              {t("chat.empty.hint")}
+            </p>
           </div>
         ) : (
           <div className="mx-auto w-full max-w-3xl space-y-5 px-4 py-6">
             {messages.map((m) =>
               m.role === "user" ? (
-                <UserMessage key={m.id} m={m} />
-              ) : m.role === "tool" ? (
-                <ToolCard
+                <motion.div
                   key={m.id}
-                  name={(m.meta?.toolName as string) ?? ""}
-                  args={m.meta}
-                  state={(m.meta?.state as string) ?? "done"}
-                  result={m.content}
-                  meta={m.meta}
-                />
+                  initial={fadeRise.initial}
+                  animate={fadeRise.animate}
+                  transition={baseTransition}
+                >
+                  <UserMessage m={m} />
+                </motion.div>
+              ) : m.role === "tool" ? (
+                <motion.div
+                  key={m.id}
+                  initial={fadeRise.initial}
+                  animate={fadeRise.animate}
+                  transition={baseTransition}
+                >
+                  <ToolCard
+                    name={(m.meta?.toolName as string) ?? ""}
+                    args={m.meta}
+                    state={(m.meta?.state as string) ?? "done"}
+                    result={m.content}
+                    meta={m.meta}
+                  />
+                </motion.div>
               ) : (
-                <AssistantMessage key={m.id} m={m} />
+                <motion.div
+                  key={m.id}
+                  initial={fadeRise.initial}
+                  animate={fadeRise.animate}
+                  transition={baseTransition}
+                >
+                  <AssistantMessage m={m} />
+                </motion.div>
               ),
             )}
             {streaming && <StreamingMessage chatId={activeChatId!} />}
             {liveTools.map(([callId, t]) => (
-              <ToolCard key={callId} name={t.name ?? ""} args={t.args} state={t.state} result={t.result} meta={t.meta} />
+              <motion.div
+                key={callId}
+                initial={fadeRise.initial}
+                animate={fadeRise.animate}
+                transition={baseTransition}
+              >
+                <ToolCard name={t.name ?? ""} args={t.args} state={t.state} result={t.result} meta={t.meta} />
+              </motion.div>
             ))}
           </div>
         )}
       </div>
 
-      {!atBottom && hasContent && (
-        <Tip text={t("jump.latest")}>
-          <button
-            onClick={scrollDown}
-            className="absolute bottom-4 left-1/2 flex h-8 w-8 -translate-x-1/2 items-center justify-center rounded-full border border-line bg-raised text-dim shadow-[0_4px_16px_rgba(0,0,0,0.4)] transition-colors hover:text-ink"
+      <AnimatePresence>
+        {!atBottom && hasContent && (
+          <motion.div
+            initial={{ opacity: 0, y: 6, scale: 0.95 }}
+            animate={{ opacity: 1, y: 0, scale: 1 }}
+            exit={{ opacity: 0, y: 6, scale: 0.95 }}
+            transition={{ duration: 0.15, ease: EASE }}
+            className="absolute bottom-4 left-1/2 -translate-x-1/2"
           >
-            <ArrowDown size={14} />
-          </button>
-        </Tip>
-      )}
+            <Tip text={t("jump.latest")}>
+              <button
+                onClick={scrollDown}
+                className="flex h-8 w-8 items-center justify-center rounded-full border border-line bg-raised text-dim shadow-[0_4px_16px_rgba(0,0,0,0.4)] transition-colors hover:text-ink"
+              >
+                <ArrowDown size={14} />
+              </button>
+            </Tip>
+          </motion.div>
+        )}
+      </AnimatePresence>
 
-      {status && (
-        <div className="absolute bottom-3 left-4 flex items-center gap-2 font-mono text-[11px]">
-          <Spinner size={12} />
-          <span className="shimmer">{STATUS_LABEL[status] ? t(STATUS_LABEL[status]) : t("status.working")}</span>
-        </div>
-      )}
+      <AnimatePresence>
+        {status && (
+          <motion.div
+            initial={{ opacity: 0, y: 4 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0 }}
+            transition={{ duration: 0.15, ease: EASE }}
+            className="absolute bottom-3 left-4 flex items-center gap-2"
+          >
+            <span className={`relative flex h-1.5 w-1.5 flex-none rounded-full ${status === "waiting-for-permission" ? "bg-warn" : "bg-accent"} dot-pulse`} />
+            <span className="shimmer font-mono text-[11px]">
+              {STATUS_LABEL[status] ? t(STATUS_LABEL[status]) : t("status.working")}
+            </span>
+          </motion.div>
+        )}
+      </AnimatePresence>
 
-      {error && (
-        <div className="mx-auto mb-2 w-full max-w-3xl px-4">
-          <div className="flex items-start gap-2.5 rounded-xl border border-err/40 bg-err/5 px-3.5 py-2.5">
-            <span className="mt-0.5 font-mono text-[10px] font-semibold uppercase tracking-wide text-err">error</span>
-            <p className="min-w-0 flex-1 break-words text-[12.5px] leading-relaxed text-dim">{error}</p>
-            <button onClick={() => dismissError(activeChatId!)} className="mt-0.5 text-faint transition-colors hover:text-ink">
-              <X size={13} />
-            </button>
-          </div>
-        </div>
-      )}
+      <AnimatePresence>
+        {error && (
+          <motion.div
+            key="error"
+            initial={{ opacity: 0, y: 6 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: 4 }}
+            transition={{ duration: 0.18, ease: EASE }}
+            className="absolute inset-x-0 bottom-0"
+          >
+            <div className="mx-auto mb-2 w-full max-w-3xl px-4">
+              <div className="flex items-start gap-2.5 rounded-xl border border-err/40 bg-err/5 px-3.5 py-2.5 backdrop-blur-sm">
+                <span className="mt-0.5 font-mono text-[10px] font-semibold uppercase tracking-wide text-err">
+                  error
+                </span>
+                <p className="min-w-0 flex-1 break-words text-[12.5px] leading-relaxed text-dim">{error}</p>
+                <button
+                  onClick={() => dismissError(activeChatId!)}
+                  className="mt-0.5 text-faint transition-colors hover:text-ink"
+                >
+                  <X size={13} />
+                </button>
+              </div>
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
     </div>
   );
 }

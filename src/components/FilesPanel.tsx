@@ -91,6 +91,16 @@ export default function FilesPanel() {
       <div className="min-h-0 flex-1 overflow-y-auto py-1.5">
         {!workspace ? (
           <p className="px-4 py-8 text-center text-[12px] text-faint">{t("files.empty")}</p>
+        ) : loading && visible.length === 0 ? (
+          <div className="space-y-2 px-3 py-2" aria-busy="true">
+            {Array.from({ length: 10 }, (_, i) => (
+              <div
+                key={i}
+                className="skeleton h-4"
+                style={{ width: `${58 + ((i * 17) % 34)}%`, marginLeft: (i % 3) * 14 }}
+              />
+            ))}
+          </div>
         ) : visible.length === 0 && !loading ? (
           <p className="px-4 py-8 text-center text-[12px] text-faint">{t("files.empty")}</p>
         ) : (

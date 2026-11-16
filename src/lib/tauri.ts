@@ -7,6 +7,7 @@ import type {
   ProcessInfo,
   ProviderConfig,
   ProviderInfo,
+  ProviderStatus,
   Settings,
   TodoItem,
 } from "./types";
@@ -52,11 +53,21 @@ export const api = {
   providerSetKey: (id: string, key: string) => invoke<void>("provider_set_key", { id, key }),
   providerRemoveKey: (id: string) => invoke<void>("provider_remove_key", { id }),
   providerTest: (id: string) =>
-    invoke<{ ok: boolean; message: string; models?: string[] }>("provider_test", { id }),
+    invoke<{
+      ok: boolean;
+      status: ProviderStatus;
+      message: string;
+      models?: string[];
+    }>("provider_test", { id }),
   providerListModels: (id: string) => invoke<string[]>("provider_list_models", { id }),
   providerGetConfig: (id: string) => invoke<ProviderConfig>("provider_get_config", { id }),
   providerSetConfig: (id: string, config: ProviderConfig) =>
     invoke<void>("provider_set_config", { id, config }),
+  customProviderSave: (
+    provider: Record<string, unknown>,
+    apiKey?: string,
+  ) => invoke<ProviderInfo>("custom_provider_save", { provider, apiKey }),
+  customProviderDelete: (id: string) => invoke<void>("custom_provider_delete", { id }),
   modelCapabilities: (provider: string, model: string) =>
     invoke<ChatCaps>("model_capabilities", { provider, model }),
 

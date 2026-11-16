@@ -1,6 +1,8 @@
 import { useState } from "react";
+import { motion } from "motion/react";
 import { Check, Circle, SquareCheck } from "lucide-react";
 import { useStore } from "../lib/store";
+import { EASE } from "../lib/motion";
 import type { QuestionDef } from "../lib/types";
 
 function One({
@@ -73,7 +75,12 @@ export default function QuestionCard() {
   const setVal = (id: string, v: string | string[]) => setValues((prev) => ({ ...prev, [id]: v }));
 
   return (
-    <div className="mx-auto my-2 w-full max-w-3xl px-4">
+    <motion.div
+      initial={{ opacity: 0, y: 10, scale: 0.99 }}
+      animate={{ opacity: 1, y: 0, scale: 1 }}
+      transition={{ duration: 0.22, ease: EASE }}
+      className="mx-auto my-2 w-full max-w-3xl px-4"
+    >
       <div className="overflow-hidden rounded-xl border border-line2 bg-raised shadow-[0_8px_28px_rgba(0,0,0,0.35)]">
         <div className="border-b border-line px-4 py-2.5 text-[13px] font-medium">{t("status.asking")}</div>
         <div className="divide-y divide-line px-4 py-1">
@@ -98,6 +105,6 @@ export default function QuestionCard() {
           </button>
         </div>
       </div>
-    </div>
+    </motion.div>
   );
 }

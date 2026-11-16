@@ -81,10 +81,20 @@ export interface Attachment {
   data?: string;
 }
 
+export type ProviderStatus =
+  | "not_configured"
+  | "untested"
+  | "testing"
+  | "connected"
+  | "failed";
+
 export interface ProviderConfig {
   enabledModels?: string[];
-  defaultModel?: string;
-  custom?: { name?: string; baseUrl?: string; format?: string; headers?: Record<string, string> };
+  defaultModel?: string | null;
+  baseUrl?: string;
+  format?: string;
+  headers?: Record<string, string>;
+  modelsPath?: string;
   [key: string]: unknown;
 }
 
@@ -93,7 +103,10 @@ export interface ProviderInfo {
   label: string;
   format: string;
   baseUrl: string;
-  connected: boolean;
+  helpUrl: string;
+  custom: boolean;
+  status: ProviderStatus;
+  message: string;
   config: ProviderConfig;
 }
 
