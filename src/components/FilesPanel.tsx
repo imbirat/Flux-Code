@@ -11,7 +11,11 @@ function baseName(p: string): string {
 
 export default function FilesPanel() {
   const t = useStore((s) => s.t);
-  const workspace = useStore((s) => s.settings.workspace);
+  // Browse the active session's workspace, not a stale global default. The
+  // global setting is only the fallback when no session is open.
+  const workspace = useStore(
+    (s) => s.chats.find((c) => c.id === s.activeChatId)?.workspace || s.settings.workspace,
+  );
   const [tree, setTree] = useState<TreeNode[]>([]);
   const [loading, setLoading] = useState(false);
   const [expanded, setExpanded] = useState<Set<string>>(new Set());

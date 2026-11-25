@@ -49,12 +49,15 @@ export default function Composer() {
   const setLeftOpen = useStore((s) => s.setLeftOpen);
   const setSettingsOpen = useStore((s) => s.setSettingsOpen);
 
-  const [text, setText] = useState("");
-  const [attachments, setAttachments] = useState<Attachment[]>([]);
+  const setDraft = useStore((s) => s.setDraft);
+  const draft = useStore((s) => (chat ? s.drafts[chat.id] : undefined));
+  const text = draft?.text ?? "";
+  const attachments = draft?.attachments ?? [];
   const [dragging, setDragging] = useState(false);
   const [busyFile, setBusyFile] = useState(false);
   const taRef = useRef<HTMLTextAreaElement>(null);
   const dropSubRef = useRef(false);
+  const sendingRef = useRef(false);
 
   const activeModel = chat?.model ?? "";
   const activeProvider = chat?.provider ?? "";
@@ -72,29 +75,36 @@ export default function Composer() {
     ta.style.height = `${Math.min(ta.scrollHeight, 208)}px`;
   }, [text]);
 
-  const addPaths = useCallback(async (paths: string[]) => {
-    if (!paths.length) return;
-    setBusyFile(true);
-    try {
-      const next: Attachment[] = [];
-      for (const p of paths.slice(0, 12)) {
-        const ext = p.split(".").pop()?.toLowerCase() ?? "";
-        if (IMAGE_EXT.has(ext)) {
-          try {
-            const data = await api.readFileBase64(p);
-            next.push({ kind: "image", path: p, name: baseName(p), mime: mimeForPath(p), data });
-          } catch {
+  const addPaths = useCallback(
+    async (paths: string[]) => {
+      const chatId = chat?.id;
+      if (!chatId || !paths.length) return;
+      setBusyFile(true);
+      try {
+        const next: Attachment[] = [];
+        for (const p of paths.slice(0, 12)) {
+          const ext = p.split(".").pop()?.toLowerCase() ?? "";
+          if (IMAGE_EXT.has(ext)) {
+            try {
+              const data = await api.readFileBase64(p);
+              next.push({ kind: "image", path: p, name: baseName(p), mime: mimeForPath(p), data });
+            } catch {
+              next.push({ kind: "file", path: p, name: baseName(p) });
+            }
+          } else {
             next.push({ kind: "file", path: p, name: baseName(p) });
           }
-        } else {
-          next.push({ kind: "file", path: p, name: baseName(p) });
         }
+        const current = useStore.getState().drafts[chatId]?.attachments ?? [];
+        const merged = [...current];
+        for (const a of next) if (!merged.some((x) => x.path === a.path)) merged.push(a);
+        setDraft(chatId, { attachments: merged.slice(0, 16) });
+      } finally {
+        setBusyFile(false);
       }
-      setAttachments((prev) => [...prev, ...next].slice(0, 16));
-    } finally {
-      setBusyFile(false);
-    }
-  }, []);
+    },
+    [chat?.id, setDraft],
+  );
 
   useEffect(() => {
     if (dropSubRef.current) return;
@@ -178,13 +188,18 @@ export default function Composer() {
     !modelUnavailable;
   const isStreaming = !!streaming || !!status;
 
-  const doSend = () => {
-    if (!canSend || isStreaming) return;
-    const body = text.trim();
-    send(body, attachments).catch(() => {});
-    setText("");
-    setAttachments([]);
-    taRef.current?.focus();
+  const doSend = async () => {
+    // isStreaming arrives via an async event, so guard the click itself too.
+    if (!canSend || isStreaming || sendingRef.current || !chat) return;
+    sendingRef.current = true;
+    try {
+      // The store consumes the draft only when the message was persisted;
+      // failures leave the text and attachments exactly where they were.
+      await send(text.trim(), attachments);
+    } finally {
+      sendingRef.current = false;
+      taRef.current?.focus();
+    }
   };
 
   return (
@@ -211,7 +226,7 @@ export default function Composer() {
                     {a.kind === "image" ? <ImageIcon size={12} className="shrink-0 text-faint" /> : <FileCode2 size={12} className="shrink-0 text-faint" />}
                     <span className="truncate">{a.name}</span>
                     <button
-                      onClick={() => setAttachments((prev) => prev.filter((_, j) => j !== i))}
+                      onClick={() => chat && setDraft(chat.id, { attachments: attachments.filter((_, j) => j !== i) })}
                       className="ml-0.5 text-faint opacity-0 transition-opacity group-hover:opacity-100 hover:text-ink"
                     >
                       ×
@@ -244,11 +259,11 @@ export default function Composer() {
             ref={taRef}
             rows={1}
             value={text}
-            onChange={(e) => setText(e.target.value)}
+            onChange={(e) => chat && setDraft(chat.id, { text: e.target.value })}
             onKeyDown={(e) => {
               if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
                 e.preventDefault();
-                doSend();
+                doSend().catch(() => {});
               }
             }}
             placeholder={modelMissing ? t("composer.noModel") : t("composer.placeholder")}
@@ -402,7 +417,7 @@ export default function Composer() {
               <Tip text={t("composer.send")}>
                 <motion.button
                   whileTap={{ scale: 0.92 }}
-                  onClick={doSend}
+                  onClick={() => doSend().catch(() => {})}
                   disabled={!canSend}
                   title={t("composer.send")}
                   className="ml-1 flex h-8 w-8 items-center justify-center rounded-xl bg-ink text-bg transition-opacity enabled:hover:opacity-85 disabled:opacity-25"

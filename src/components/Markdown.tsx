@@ -7,6 +7,7 @@ import rehypeHighlight from "rehype-highlight";
 import hljsPowershell from "highlight.js/lib/languages/powershell";
 import { Check, ChevronDown, Copy, WrapText } from "lucide-react";
 import { api } from "../lib/tauri";
+import { safeLinkHref } from "../lib/safeUrl";
 
 function extractText(node: any): string {
   if (node == null) return "";
@@ -83,17 +84,23 @@ function CodePre(props: any) {
 
 const components = {
   pre: CodePre,
-  a: ({ href, children }: { href?: string; children: ReactNode }) => (
-    <a
-      href={href}
-      onClick={(e) => {
-        e.preventDefault();
-        if (href) api.openExternal(href).catch(() => {});
-      }}
-    >
-      {children}
-    </a>
-  ),
+  a: ({ href, children }: { href?: string; children: ReactNode }) => {
+    const safe = safeLinkHref(href);
+    // file:, javascript:, data: and malformed targets are rendered as plain
+    // text — the model must never be able to trigger a local path or script.
+    if (!safe) return <span>{children}</span>;
+    return (
+      <a
+        href={safe}
+        onClick={(e) => {
+          e.preventDefault();
+          api.openExternal(safe).catch(() => {});
+        }}
+      >
+        {children}
+      </a>
+    );
+  },
   img: ({ src, alt }: { src?: string; alt?: string }) =>
     typeof src === "string" ? <img src={src} alt={alt ?? ""} loading="lazy" /> : null,
 };

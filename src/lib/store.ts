@@ -23,6 +23,16 @@ interface StreamingBuf {
   thinking: string;
 }
 
+export interface ComposerDraft {
+  text: string;
+  attachments: Attachment[];
+}
+
+const EMPTY_DRAFT: ComposerDraft = { text: "", attachments: [] };
+
+const errorText = (e: unknown): string =>
+  typeof e === "string" ? e : e instanceof Error ? e.message : String(e);
+
 interface Store {
   booted: boolean;
   settings: Settings;
@@ -34,6 +44,8 @@ interface Store {
   /** Top-level navigation: home = Projects/Sessions page, chat = session view. */
   view: "home" | "chat";
   messages: Record<string, ChatMessage[]>;
+  /** Unsent text and attachments, isolated per chat and kept across switches. */
+  drafts: Record<string, ComposerDraft | undefined>;
   streaming: Record<string, StreamingBuf | undefined>;
   status: Record<string, string | undefined>;
   tools: Record<string, Record<string, ToolLive>>;
@@ -80,7 +92,10 @@ interface Store {
   ensureCaps: (provider: string, model: string) => Promise<ChatCaps | null>;
   setWorkspace: (ws: string) => Promise<void>;
   addExtraFolder: (folder: string) => Promise<void>;
-  send: (text: string, attachments: Attachment[]) => Promise<void>;
+  setDraft: (chatId: string, patch: Partial<ComposerDraft>) => void;
+  clearDraft: (chatId: string) => void;
+  /** Returns true only when the message was persisted and can be cleared. */
+  send: (text: string, attachments: Attachment[]) => Promise<boolean>;
   stop: () => Promise<void>;
   setTodos: (chatId: string, items: TodoItem[]) => Promise<void>;
   respondPermission: (allow: boolean, remember: boolean) => Promise<void>;
@@ -115,6 +130,7 @@ export const useStore = create<Store>((set, get) => ({
   activeProjectId: null,
   view: "home",
   messages: {},
+  drafts: {},
   streaming: {},
   status: {},
   tools: {},
@@ -166,14 +182,16 @@ export const useStore = create<Store>((set, get) => ({
     } catch {
       /* ignore */
     }
-    // Restore the last used project. The view stays "home": startup never
-    // auto-creates or auto-opens a session — the user decides.
+    // Restore the last used project. An empty `lastProjectId` means the user
+    // deliberately chose All Projects, so do not silently select a project.
     const { settings, projects } = get();
     const last = settings.lastProjectId;
-    if (last && projects.some((p) => p.id === last)) {
+    if (last === undefined) {
+      if (projects.length > 0) set({ activeProjectId: projects[0].id });
+    } else if (last && projects.some((p) => p.id === last)) {
       set({ activeProjectId: last });
-    } else if (projects.length > 0) {
-      set({ activeProjectId: projects[0].id });
+    } else {
+      set({ activeProjectId: null });
     }
     set({ booted: true });
   },
@@ -211,11 +229,12 @@ export const useStore = create<Store>((set, get) => ({
       const projects = await api.projectList();
       set((s) => ({
         projects,
-        // Drop a stale selection (e.g. project removed in another view).
+        // A null selection is the user's explicit "All Projects" choice and
+        // must survive refreshes; only a stale id falls back to it.
         activeProjectId:
           s.activeProjectId && projects.some((p) => p.id === s.activeProjectId)
             ? s.activeProjectId
-            : (projects[0]?.id ?? null),
+            : null,
       }));
     } catch {
       /* ignore */
@@ -224,10 +243,9 @@ export const useStore = create<Store>((set, get) => ({
 
   setActiveProject: (id) => {
     set({ activeProjectId: id });
-    if (id) {
-      // Persist the choice so it survives restarts (best effort).
-      get().applySettings({ lastProjectId: id }).catch(() => {});
-    }
+    // Persist the choice so it survives restarts (best effort). An empty
+    // string records the explicit "All Projects" selection.
+    get().applySettings({ lastProjectId: id ?? "" }).catch(() => {});
   },
 
   addProject: async (path, name) => {
@@ -257,10 +275,10 @@ export const useStore = create<Store>((set, get) => ({
       await get().refreshChats();
       await get().refreshProjects();
       // If the active chat belonged to the removed project it is now unlinked;
-      // session data stays intact.
+      // session data stays intact. Fall back to All Projects rather than
+      // silently selecting a different project.
       if (get().activeProjectId === id) {
-        const projects = get().projects;
-        set({ activeProjectId: projects[0]?.id ?? null });
+        set({ activeProjectId: null });
       }
     } catch (e) {
       throw new Error(typeof e === "string" ? e : String(e));
@@ -347,21 +365,35 @@ export const useStore = create<Store>((set, get) => ({
   },
 
   renameChat: async (id, title) => {
+    const previous = get().chats.find((c) => c.id === id);
+    if (!previous) return;
     set((s) => ({ chats: s.chats.map((c) => (c.id === id ? { ...c, title } : c)) }));
     try {
       await api.renameChat(id, title);
-    } catch {
-      /* ignore */
+    } catch (e) {
+      // Roll back only if this request is still the visible title.
+      set((s) => ({
+        chats: s.chats.map((c) => (c.id === id && c.title === title ? previous : c)),
+        toast: errorText(e),
+      }));
     }
   },
 
   deleteChat: async (id) => {
     try {
       await api.deleteChat(id);
-    } catch {
-      /* ignore */
+    } catch (e) {
+      // The row (and its files) still exists; keep it selected and report.
+      set({ toast: errorText(e) });
+      await get().refreshChats();
+      return;
     }
     await get().refreshChats();
+    set((s) => {
+      const drafts = { ...s.drafts };
+      delete drafts[id];
+      return { drafts };
+    });
     if (get().activeChatId === id) {
       // Never auto-open another session — return to the home page.
       set({ activeChatId: null, view: "home", messages: { ...get().messages, [id]: [] } });
@@ -383,15 +415,32 @@ export const useStore = create<Store>((set, get) => ({
   },
 
   selectModel: async (provider, model) => {
+    const id = get().activeChatId;
+    const previousChat = id ? get().chats.find((c) => c.id === id) : undefined;
+    const previousProvider = get().settings.lastProvider;
+    const previousModel = get().settings.lastModel;
     await get().ensureCaps(provider, model);
     await get().applySettings({ lastProvider: provider, lastModel: model });
-    const id = get().activeChatId;
     if (!id) return;
+    // Optimistic switch so the composer reflects the choice immediately.
+    set((s) => ({
+      chats: s.chats.map((c) => (c.id === id ? { ...c, provider, model, effort: "" } : c)),
+    }));
     try {
       const updated = await api.updateChat(id, { provider, model, effort: "" });
       set((s) => ({ chats: s.chats.map((c) => (c.id === id ? updated : c)) }));
-    } catch {
-      /* ignore */
+    } catch (e) {
+      set((s) => ({
+        chats: s.chats.map((c) =>
+          c.id === id && c.provider === provider && c.model === model && previousChat
+            ? previousChat
+            : c,
+        ),
+        toast: errorText(e),
+      }));
+      get()
+        .applySettings({ lastProvider: previousProvider, lastModel: previousModel })
+        .catch(() => {});
     }
   },
 
@@ -399,6 +448,9 @@ export const useStore = create<Store>((set, get) => ({
     const s = get();
     const chat = s.activeChat();
     if (!chat) return;
+    set((st) => ({
+      chats: st.chats.map((c) => (c.id === chat.id ? { ...c, effort } : c)),
+    }));
     try {
       const updated = await api.updateChat(chat.id, { effort });
       set((st) => ({ chats: st.chats.map((c) => (c.id === chat.id ? updated : c)) }));
@@ -406,32 +458,49 @@ export const useStore = create<Store>((set, get) => ({
       await get().applySettings({
         effortPrefs: { ...s.settings.effortPrefs, [key]: effort },
       });
-    } catch {
-      /* ignore */
+    } catch (e) {
+      set((st) => ({
+        chats: st.chats.map((c) =>
+          c.id === chat.id && c.effort === effort ? { ...c, effort: chat.effort } : c,
+        ),
+        toast: errorText(e),
+      }));
     }
   },
 
   setPermissionMode: async (mode) => {
     const chat = get().activeChat();
     if (!chat) return;
+    set((st) => ({
+      chats: st.chats.map((c) => (c.id === chat.id ? { ...c, permissionMode: mode } : c)),
+    }));
     try {
       const updated = await api.updateChat(chat.id, { permissionMode: mode });
       set((st) => ({ chats: st.chats.map((c) => (c.id === chat.id ? updated : c)) }));
-    } catch {
-      /* ignore */
+    } catch (e) {
+      set((st) => ({
+        chats: st.chats.map((c) =>
+          c.id === chat.id && c.permissionMode === mode
+            ? { ...c, permissionMode: chat.permissionMode }
+            : c,
+        ),
+        toast: errorText(e),
+      }));
     }
   },
 
   setWorkspace: async (ws) => {
+    const previous = get().settings.workspace;
     await get().applySettings({ workspace: ws });
     const chat = get().activeChat();
-    if (chat) {
-      try {
-        const updated = await api.updateChat(chat.id, { workspace: ws });
-        set((st) => ({ chats: st.chats.map((c) => (c.id === chat.id ? updated : c)) }));
-      } catch {
-        /* ignore */
-      }
+    if (!chat) return;
+    try {
+      const updated = await api.updateChat(chat.id, { workspace: ws });
+      set((st) => ({ chats: st.chats.map((c) => (c.id === chat.id ? updated : c)) }));
+    } catch (e) {
+      // Restore the default workspace too: the session keeps its old folder.
+      await get().applySettings({ workspace: previous });
+      set({ toast: errorText(e) });
     }
   },
 
@@ -440,20 +509,56 @@ export const useStore = create<Store>((set, get) => ({
     await get().applySettings({ extraFolders: folders });
   },
 
+  setDraft: (chatId, patch) =>
+    set((s) => {
+      const prev = s.drafts[chatId] ?? EMPTY_DRAFT;
+      return { drafts: { ...s.drafts, [chatId]: { ...prev, ...patch } } };
+    }),
+
+  clearDraft: (chatId) =>
+    set((s) => {
+      const drafts = { ...s.drafts };
+      delete drafts[chatId];
+      return { drafts };
+    }),
+
   send: async (text, attachments) => {
-    const s = get();
-    let chatId = s.activeChatId;
+    let chatId = get().activeChatId;
     if (!chatId) {
-      await s.startNewChat();
+      try {
+        await get().startNewChat();
+      } catch (e) {
+        set({ toast: errorText(e) });
+        return false;
+      }
       chatId = get().activeChatId;
     }
-    if (!chatId) return;
+    if (!chatId) return false;
+    const draft = get().drafts[chatId];
     try {
       await api.sendMessage(chatId, text, attachments);
-      await get().loadMessages(chatId);
-      await get().refreshChats();
+      // Consume the draft only after persistence, and only if the user has not
+      // typed or attached something newer while the request was in flight.
+      if (draft) {
+        set((st) => {
+          const current = st.drafts[chatId];
+          if (
+            !current ||
+            current.text !== draft.text ||
+            current.attachments !== draft.attachments
+          ) {
+            return {};
+          }
+          const drafts = { ...st.drafts };
+          delete drafts[chatId];
+          return { drafts };
+        });
+      }
+      await Promise.all([get().loadMessages(chatId), get().refreshChats()]);
+      return true;
     } catch (e) {
-      set((st) => ({ errors: { ...st.errors, [chatId!]: String(e) } }));
+      set((st) => ({ errors: { ...st.errors, [chatId]: errorText(e) } }));
+      return false;
     }
   },
 

@@ -1,13 +1,23 @@
 import { useEffect, useMemo, useState } from "react";
-import { ExternalLink, Monitor, RefreshCw } from "lucide-react";
+import { ExternalLink, Monitor, RefreshCw, Square } from "lucide-react";
 import { useStore } from "../lib/store";
 import { api } from "../lib/tauri";
 import { IconButton, Tip } from "./ui";
+
+function isLocalPreview(url: string): boolean {
+  try {
+    const host = new URL(url).hostname.toLowerCase();
+    return host === "localhost" || host === "127.0.0.1" || host === "[::1]" || host === "0.0.0.0";
+  } catch {
+    return false;
+  }
+}
 
 export default function PreviewPanel() {
   const t = useStore((s) => s.t);
   const servers = useStore((s) => s.servers);
   const processes = useStore((s) => s.processes);
+  const refreshProcesses = useStore((s) => s.refreshProcesses);
   const [selected, setSelected] = useState(0);
   const [nonce, setNonce] = useState(0);
 
@@ -16,11 +26,26 @@ export default function PreviewPanel() {
     if (selected > newest) setSelected(Math.max(0, newest));
   }, [newest, selected]);
 
-  const alive = (processId: number) =>
-    processes.some((p) => p.id === processId && p.exited === 0);
+  const processFor = (processId: number) => processes.find((p) => p.id === processId);
+  const alive = (processId: number) => {
+    const proc = processFor(processId);
+    // Backends before the state field reported exited === -1 while running.
+    return proc ? (proc.running ?? proc.exited < 0) : true;
+  };
 
-  const server = servers[selected];
+  const server = servers[selected] ?? servers[0];
   const url = server?.url ?? "";
+  const proc = server ? processFor(server.processId) : undefined;
+  const stopping = proc?.state === "stopping";
+  const sandbox = `allow-scripts allow-forms allow-popups allow-modals${
+    isLocalPreview(url) ? " allow-same-origin" : ""
+  }`;
+
+  const stopServer = async () => {
+    if (!server) return;
+    await api.stopProcess(server.processId, proc?.chatId).catch(() => {});
+    await refreshProcesses().catch(() => {});
+  };
 
   return (
     <div className="flex h-full flex-col">
@@ -44,6 +69,19 @@ export default function PreviewPanel() {
                 </button>
               ))}
             </div>
+            {alive(server.processId) && (
+              <Tip text={t("preview.stop")}>
+                <IconButton
+                  className={`h-6 w-6 ${stopping ? "opacity-40" : ""}`}
+                  onClick={() => {
+                    if (!stopping) stopServer().catch(() => {});
+                  }}
+                  title={t("preview.stop")}
+                >
+                  <Square size={11} />
+                </IconButton>
+              </Tip>
+            )}
             <Tip text={t("preview.refresh")}>
               <IconButton className="h-6 w-6" onClick={() => setNonce((n) => n + 1)} title={t("preview.refresh")}>
                 <RefreshCw size={12} />
@@ -60,7 +98,8 @@ export default function PreviewPanel() {
             src={url}
             title={t("preview.title")}
             className="min-h-0 flex-1 border-0 bg-white"
-            sandbox="allow-scripts allow-forms allow-popups allow-modals allow-same-origin"
+            sandbox={sandbox}
+            referrerPolicy="no-referrer"
           />
         </>
       ) : (

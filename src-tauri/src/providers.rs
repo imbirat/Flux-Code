@@ -66,7 +66,6 @@ pub fn is_builtin(id: &str) -> bool {
 /// A resolved provider configuration: everything the adapters need.
 #[derive(Debug, Clone)]
 pub struct Resolved {
-    pub id: String,
     pub format: String,
     pub base_url: String,
     pub extra_headers: Vec<(String, String)>,
@@ -85,17 +84,14 @@ pub fn resolve(app: &tauri::AppHandle, id: &str) -> Result<Resolved, String> {
             .unwrap_or("")
             .to_string();
         return Ok(Resolved {
-            id: id.into(),
             format: d.format.to_string(),
             base_url: d.base_url.to_string(),
             extra_headers: vec![],
             models_path,
         });
     }
-    let row = crate::db::custom_get(app, id)
-        .map_err(|_| format!("Unknown provider: {id}"))?;
+    let row = crate::db::custom_get(app, id).map_err(|_| format!("Unknown provider: {id}"))?;
     Ok(Resolved {
-        id: row.id,
         format: row.format,
         base_url: row.base_url,
         extra_headers: headers_from_value(&row.headers),
@@ -135,9 +131,22 @@ pub fn unique_custom_id(name_slug: &str, existing: &[String]) -> String {
 pub fn looks_non_chat(id: &str) -> bool {
     let l = id.to_lowercase();
     const BAD: [&str; 16] = [
-        "embedding", "embed-", "-embed", "whisper", "tts", "dall-e", "dalle",
-        "moderation", "transcribe", "transcription", "audio", "image-gen",
-        "stable-diffusion", "sdxl", "midjourney", "/rerank",
+        "embedding",
+        "embed-",
+        "-embed",
+        "whisper",
+        "tts",
+        "dall-e",
+        "dalle",
+        "moderation",
+        "transcribe",
+        "transcription",
+        "audio",
+        "image-gen",
+        "stable-diffusion",
+        "sdxl",
+        "midjourney",
+        "/rerank",
     ];
     BAD.iter().any(|b| l.contains(b))
 }
@@ -179,9 +188,11 @@ fn supports_text_output(id: &str, m: &Value) -> bool {
         .or_else(|| m.get("output_modalities"))
         .and_then(|x| x.as_array());
     if let Some(mods) = modalities {
-        return mods
-            .iter()
-            .any(|x| x.as_str().map(|s| s.eq_ignore_ascii_case("text")).unwrap_or(false));
+        return mods.iter().any(|x| {
+            x.as_str()
+                .map(|s| s.eq_ignore_ascii_case("text"))
+                .unwrap_or(false)
+        });
     }
     !looks_non_chat(id)
 }
@@ -196,8 +207,11 @@ pub fn parse_gemini_models(v: &Value) -> Vec<String> {
                 .get("supportedGenerationMethods")
                 .and_then(|s| s.as_array())
                 .map(|a| {
-                    a.iter()
-                        .any(|x| x.as_str().map(|s| s.contains("generateContent")).unwrap_or(false))
+                    a.iter().any(|x| {
+                        x.as_str()
+                            .map(|s| s.contains("generateContent"))
+                            .unwrap_or(false)
+                    })
                 })
                 .unwrap_or(true);
             if !supported {
@@ -330,9 +344,7 @@ pub async fn list_models_http(
             let mut token: Option<String> = None;
             let mut seen_tokens: Vec<String> = vec![];
             for _ in 0..MAX_PAGES {
-                let mut url = format!(
-                    "{base}{path}?pageSize=1000"
-                );
+                let mut url = format!("{base}{path}?pageSize=1000");
                 if let Some(t) = &token {
                     url.push_str(&format!("&pageToken={}", urlencode(t)));
                 }
@@ -423,7 +435,10 @@ fn apply_headers(
 }
 
 async fn send_json(req: reqwest::RequestBuilder) -> Result<Value, String> {
-    let resp = req.send().await.map_err(|e| format!("Network error: {e}"))?;
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| format!("Network error: {e}"))?;
     let status = resp.status();
     let text = resp.text().await.unwrap_or_default();
     if !status.is_success() {
@@ -467,7 +482,10 @@ pub async fn ping_chat(
     let (url, body) = ping_request(format, base, model.trim());
     let req = auth(client.post(&url).json(&body), format, api_key);
     let req = apply_headers(req, extra_headers);
-    let resp = req.send().await.map_err(|e| format!("Network error: {e}"))?;
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| format!("Network error: {e}"))?;
     let status = resp.status();
     let text = resp.text().await.unwrap_or_default();
     if !status.is_success() {
@@ -540,7 +558,10 @@ mod tests {
         let v = json!({ "data": [
             { "id": "b-model" }, { "id": "a-model" }, { "id": "b-model" }, { "id": 42 }
         ]});
-        assert_eq!(parse_openai_models(&v), vec!["a-model".to_string(), "b-model".to_string()]);
+        assert_eq!(
+            parse_openai_models(&v),
+            vec!["a-model".to_string(), "b-model".to_string()]
+        );
         assert_eq!(parse_openai_models(&json!({})), Vec::<String>::new());
     }
 
@@ -554,13 +575,19 @@ mod tests {
         ]});
         assert_eq!(
             parse_gemini_models(&v),
-            vec!["gemini-2.0-flash".to_string(), "gemini-2.0-flash-lite".to_string()]
+            vec![
+                "gemini-2.0-flash".to_string(),
+                "gemini-2.0-flash-lite".to_string()
+            ]
         );
     }
 
     #[test]
     fn gemini_pagination_token() {
-        assert_eq!(gemini_next_page(&json!({ "nextPageToken": "abc" })), Some("abc".to_string()));
+        assert_eq!(
+            gemini_next_page(&json!({ "nextPageToken": "abc" })),
+            Some("abc".to_string())
+        );
         assert_eq!(gemini_next_page(&json!({})), None);
         assert_eq!(gemini_next_page(&json!({ "nextPageToken": "" })), None);
     }
@@ -568,10 +595,17 @@ mod tests {
     #[test]
     fn parse_anthropic_models_and_pagination() {
         let v = json!({ "data": [ { "id": "claude-sonnet-4" } ], "has_more": true, "last_id": "claude-sonnet-4" });
-        assert_eq!(parse_anthropic_models(&v), vec!["claude-sonnet-4".to_string()]);
+        assert_eq!(
+            parse_anthropic_models(&v),
+            vec!["claude-sonnet-4".to_string()]
+        );
         assert_eq!(anthropic_next_page(&v), Some("claude-sonnet-4".to_string()));
         assert_eq!(anthropic_next_page(&json!({ "has_more": false })), None);
-        assert_eq!(anthropic_next_page(&json!({ "has_more": true })), None, "no cursor means stop");
+        assert_eq!(
+            anthropic_next_page(&json!({ "has_more": true })),
+            None,
+            "no cursor means stop"
+        );
     }
 
     #[test]
@@ -585,7 +619,12 @@ mod tests {
 
     #[test]
     fn dedupe_sort_removes_empty_and_duplicates() {
-        let ids = vec!["".to_string(), "b".to_string(), "a".to_string(), "b".to_string()];
+        let ids = vec![
+            "".to_string(),
+            "b".to_string(),
+            "a".to_string(),
+            "b".to_string(),
+        ];
         assert_eq!(dedupe_sort(ids), vec!["a".to_string(), "b".to_string()]);
     }
 
@@ -598,7 +637,10 @@ mod tests {
         ]});
         assert_eq!(
             parse_openai_models(&v),
-            vec!["vendor/no-meta".to_string(), "vendor/text-model".to_string()]
+            vec![
+                "vendor/no-meta".to_string(),
+                "vendor/text-model".to_string()
+            ]
         );
         // Top-level output_modalities (non-OpenRouter shape) is honored too.
         let v2 = json!({ "data": [
@@ -643,9 +685,19 @@ mod tests {
             Some("b".to_string())
         );
         // No has_more, or no cursor, or an empty cursor all mean "stop".
-        assert_eq!(openai_next_page(&json!({ "has_more": false, "last_id": "b" })), None);
-        assert_eq!(openai_next_page(&json!({ "has_more": true })), None, "no cursor means stop");
-        assert_eq!(openai_next_page(&json!({ "has_more": true, "last_id": "" })), None);
+        assert_eq!(
+            openai_next_page(&json!({ "has_more": false, "last_id": "b" })),
+            None
+        );
+        assert_eq!(
+            openai_next_page(&json!({ "has_more": true })),
+            None,
+            "no cursor means stop"
+        );
+        assert_eq!(
+            openai_next_page(&json!({ "has_more": true, "last_id": "" })),
+            None
+        );
         assert_eq!(openai_next_page(&json!({})), None);
     }
 
@@ -677,7 +729,9 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         std::thread::spawn(move || {
             for (status, body) in responses {
-                let Ok((mut stream, _)) = listener.accept() else { break };
+                let Ok((mut stream, _)) = listener.accept() else {
+                    break;
+                };
                 let mut buf = [0u8; 8192];
                 let _ = stream.read(&mut buf);
                 let resp = format!(
@@ -694,10 +748,18 @@ mod tests {
     #[tokio::test]
     async fn openai_discovery_follows_cursor_and_dedupes_pages() {
         let base = spawn_mock(vec![
-            (200, r#"{"data":[{"id":"m-b"},{"id":"m-a"}],"has_more":true,"last_id":"m-b"}"#),
-            (200, r#"{"data":[{"id":"m-b"},{"id":"m-c"}],"has_more":false}"#),
+            (
+                200,
+                r#"{"data":[{"id":"m-b"},{"id":"m-a"}],"has_more":true,"last_id":"m-b"}"#,
+            ),
+            (
+                200,
+                r#"{"data":[{"id":"m-b"},{"id":"m-c"}],"has_more":false}"#,
+            ),
         ]);
-        let models = list_models_http("openai", &base, Some("k"), &[], "/models").await.unwrap();
+        let models = list_models_http("openai", &base, Some("k"), &[], "/models")
+            .await
+            .unwrap();
         assert_eq!(
             models,
             vec!["m-a".to_string(), "m-b".to_string(), "m-c".to_string()]
@@ -708,17 +770,24 @@ mod tests {
     async fn openai_discovery_stops_without_cursor() {
         // Single-page response: no has_more/last_id, exactly one request.
         let base = spawn_mock(vec![(200, r#"{"data":[{"id":"only"}]}"#)]);
-        let models = list_models_http("openai", &base, Some("k"), &[], "/models").await.unwrap();
+        let models = list_models_http("openai", &base, Some("k"), &[], "/models")
+            .await
+            .unwrap();
         assert_eq!(models, vec!["only".to_string()]);
     }
 
     #[tokio::test]
     async fn openai_discovery_empty_final_page_is_ok() {
         let base = spawn_mock(vec![
-            (200, r#"{"data":[{"id":"m-a"}],"has_more":true,"last_id":"m-a"}"#),
+            (
+                200,
+                r#"{"data":[{"id":"m-a"}],"has_more":true,"last_id":"m-a"}"#,
+            ),
             (200, r#"{"data":[]}"#),
         ]);
-        let models = list_models_http("openai", &base, Some("k"), &[], "/models").await.unwrap();
+        let models = list_models_http("openai", &base, Some("k"), &[], "/models")
+            .await
+            .unwrap();
         assert_eq!(models, vec!["m-a".to_string()]);
     }
 
@@ -727,7 +796,9 @@ mod tests {
         // Authenticated HTTP success with zero models: Ok(vec![]) — the caller
         // decides the verdict (connection status is separate from discovery).
         let base = spawn_mock(vec![(200, r#"{"data":[]}"#)]);
-        let models = list_models_http("openai", &base, Some("k"), &[], "/models").await.unwrap();
+        let models = list_models_http("openai", &base, Some("k"), &[], "/models")
+            .await
+            .unwrap();
         assert!(models.is_empty());
     }
 
@@ -744,7 +815,10 @@ mod tests {
     #[tokio::test]
     async fn discovery_mid_pagination_error_propagates() {
         let base = spawn_mock(vec![
-            (200, r#"{"data":[{"id":"m-a"}],"has_more":true,"last_id":"m-a"}"#),
+            (
+                200,
+                r#"{"data":[{"id":"m-a"}],"has_more":true,"last_id":"m-a"}"#,
+            ),
             (429, r#"{"error":{"message":"slow down"}}"#),
         ]);
         let err = list_models_http("openai", &base, Some("k"), &[], "/models")
@@ -762,14 +836,18 @@ mod tests {
     #[tokio::test]
     async fn ping_chat_reports_auth_failure() {
         let base = spawn_mock(vec![(403, r#"{"error":{"message":"forbidden"}}"#)]);
-        let err = ping_chat("openai", &base, "k", &[], "m-1").await.unwrap_err();
+        let err = ping_chat("openai", &base, "k", &[], "m-1")
+            .await
+            .unwrap_err();
         assert!(err.starts_with("Provider error 403"), "got: {err}");
     }
 
     #[tokio::test]
     async fn ping_chat_reports_unreachable_endpoint() {
         // Port 1 on loopback is never listening: a clean network failure.
-        let err = ping_chat("openai", "http://127.0.0.1:1", "k", &[], "m-1").await.unwrap_err();
+        let err = ping_chat("openai", "http://127.0.0.1:1", "k", &[], "m-1")
+            .await
+            .unwrap_err();
         assert!(err.starts_with("Network error"), "got: {err}");
     }
 }

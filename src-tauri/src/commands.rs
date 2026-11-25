@@ -82,6 +82,9 @@ pub fn rename_chat(app: AppHandle, chat_id: String, title: String) -> R<()> {
 
 #[tauri::command(rename_all = "camelCase")]
 pub fn delete_chat(app: AppHandle, chat_id: String) -> R<()> {
+    // Stop the turn, drop pending modals, end owned processes, then delete the
+    // rows. Any late task now sees a missing chat and cannot write.
+    agent::forget_chat(&app, &chat_id);
     db::delete_chat(&app, &chat_id)
 }
 
@@ -92,21 +95,29 @@ pub fn update_chat(app: AppHandle, chat_id: String, patch: Value) -> R<db::ChatS
 
 // ---------- projects ----------
 
-/// Canonicalize a user-supplied folder path: absolute, existing, without the
-/// `\\?\` verbatim prefix Windows adds, and without trailing separators.
+/// Canonicalize a user-supplied folder path: absolute, existing, in plain
+/// (non-verbatim) form. Trailing separators are stripped — except from drive
+/// roots, where `C:\` must keep its separator (trimming it would produce the
+/// invalid relative-drive path `C:`). UNC paths come back as `\\srv\share\…`
+/// with the `\\?\UNC\` prefix resolved.
 fn canonical_project_path(raw: &str) -> R<String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return Err("Choose a folder for the project".into());
     }
-    let p = std::fs::canonicalize(trimmed).map_err(|e| {
-        format!("Folder does not exist or is not accessible: {trimmed} ({e})")
-    })?;
+    let p = std::fs::canonicalize(trimmed)
+        .map_err(|e| format!("Folder does not exist or is not accessible: {trimmed} ({e})"))?;
     if !p.is_dir() {
         return Err(format!("Not a folder: {trimmed}"));
     }
-    let s = p.to_string_lossy().trim_end_matches(['/', '\\']).to_string();
-    Ok(s.strip_prefix(r"\\?\").unwrap_or(&s).to_string())
+    let s = crate::permissions::to_plain(&p)
+        .to_string_lossy()
+        .to_string();
+    let is_drive_root = s.len() <= 3 && s.as_bytes().get(1) == Some(&b':');
+    if is_drive_root {
+        return Ok(format!("{}\\", s.trim_end_matches(['/', '\\'])));
+    }
+    Ok(s.trim_end_matches(['/', '\\']).to_string())
 }
 
 #[tauri::command]
@@ -140,7 +151,12 @@ pub fn get_messages(app: AppHandle, chat_id: String) -> R<Vec<db::StoredMessage>
 }
 
 #[tauri::command(rename_all = "camelCase")]
-pub fn send_message(app: AppHandle, chat_id: String, text: String, attachments: Vec<Value>) -> R<()> {
+pub fn send_message(
+    app: AppHandle,
+    chat_id: String,
+    text: String,
+    attachments: Vec<Value>,
+) -> R<()> {
     agent::send(&app, &chat_id, &text, attachments)
 }
 
@@ -308,7 +324,11 @@ async fn discover(app: &AppHandle, id: &str) -> (Vec<String>, bool, String) {
     let models = providers::list_models_http(
         &resolved.format,
         &resolved.base_url,
-        if key.is_empty() { None } else { Some(key.as_str()) },
+        if key.is_empty() {
+            None
+        } else {
+            Some(key.as_str())
+        },
         &resolved.extra_headers,
         &resolved.models_path,
     )
@@ -341,11 +361,18 @@ fn ping_candidate(default_model: &str, manual: &[String], enabled: &[String]) ->
 fn ping_model_for(app: &AppHandle, id: &str) -> String {
     if providers::is_builtin(id) {
         let cfg = db::provider_config_get(app, id);
-        let def = cfg.get("defaultModel").and_then(|v| v.as_str()).unwrap_or("");
+        let def = cfg
+            .get("defaultModel")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
         let enabled: Vec<String> = cfg
             .get("enabledModels")
             .and_then(|v| v.as_array())
-            .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str().map(String::from))
+                    .collect()
+            })
             .unwrap_or_default();
         ping_candidate(def, &[], &enabled)
     } else {
@@ -430,13 +457,19 @@ async fn test_provider(app: &AppHandle, id: &str) -> R<Value> {
     // native chat shape using the model the user actually configured.
     let mut ping: Option<Result<String, String>> = None;
     if !discovery_ok {
-        if let Some(r) = providers::resolve(app, id).ok() {
+        if let Ok(r) = providers::resolve(app, id) {
             if !r.base_url.is_empty() {
                 let key = crate::creds::get_key(id).ok().flatten().unwrap_or_default();
                 let ping_model = ping_model_for(app, id);
                 if !key.is_empty() && !ping_model.is_empty() {
-                    match providers::ping_chat(&r.format, &r.base_url, &key, &r.extra_headers, &ping_model)
-                        .await
+                    match providers::ping_chat(
+                        &r.format,
+                        &r.base_url,
+                        &key,
+                        &r.extra_headers,
+                        &ping_model,
+                    )
+                    .await
                     {
                         Ok(()) => ping = Some(Ok(ping_model)),
                         Err(e) => ping = Some(Err(e)),
@@ -498,7 +531,9 @@ pub fn provider_set_config(app: AppHandle, id: String, config: Value) -> R<()> {
         }
         if let Some(m) = config.get("manualModels").and_then(|v| v.as_array()) {
             row.manual_models = providers::dedupe_sort(
-                m.iter().filter_map(|x| x.as_str().map(String::from)).collect(),
+                m.iter()
+                    .filter_map(|x| x.as_str().map(String::from))
+                    .collect(),
             );
         }
         if let Some(m) = config.get("defaultModel") {
@@ -551,7 +586,10 @@ pub async fn custom_provider_save(
     {
         return Err("Base URL must start with http:// or https://".into());
     }
-    let headers = provider.get("headers").cloned().unwrap_or_else(|| json!({}));
+    let headers = provider
+        .get("headers")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
     if !headers.is_object() {
         return Err("Headers must be a JSON object".into());
     }
@@ -564,11 +602,19 @@ pub async fn custom_provider_save(
     let manual_models_opt: Option<Vec<String>> = provider
         .get("manualModels")
         .and_then(|v| v.as_array())
-        .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect());
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(String::from))
+                .collect()
+        });
     let enabled_models: Vec<String> = provider
         .get("enabledModels")
         .and_then(|v| v.as_array())
-        .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(String::from))
+                .collect()
+        })
         .unwrap_or_default();
 
     let mut existing = db::custom_list(&app)?;
@@ -583,6 +629,13 @@ pub async fn custom_provider_save(
 
     let row = match existing.iter_mut().find(|p| p.id == id_opt) {
         Some(p) => {
+            // Any endpoint-shaping change invalidates the previous verdict, not
+            // just a "connected" one: a stale failure/success must not survive
+            // a new base URL, wire format, headers or listing path.
+            let config_changed = p.base_url != base_url
+                || p.format != format
+                || p.headers != headers
+                || p.models_path != models_path;
             p.name = name;
             p.format = format;
             p.base_url = base_url;
@@ -593,8 +646,7 @@ pub async fn custom_provider_save(
             if let Some(mm) = &manual_models_opt {
                 p.manual_models = providers::dedupe_sort(mm.clone());
             }
-            // Editing the endpoint invalidates a previous "connected" verdict.
-            if p.status == "connected" {
+            if config_changed {
                 p.status = "untested".into();
                 p.message.clear();
             }
@@ -679,8 +731,14 @@ pub fn get_default_workspace(_app: AppHandle) -> R<String> {
 pub fn list_dir_tree(app: AppHandle, path: String, depth: u32) -> R<Vec<Value>> {
     let _ = app;
     let root = PathBuf::from(&path);
-    if !root.exists() {
+    if !root.is_dir() {
         return Err("Folder does not exist".into());
+    }
+    // The Files panel must never browse through a linked root either.
+    if let Ok(md) = std::fs::symlink_metadata(&root) {
+        if md.file_type().is_symlink() {
+            return Err("Refusing to browse a linked folder".into());
+        }
     }
     let mut out = vec![];
     walk_nodes(&root, 0, depth.min(6) as usize, &mut out);
@@ -688,15 +746,32 @@ pub fn list_dir_tree(app: AppHandle, path: String, depth: u32) -> R<Vec<Value>> 
 }
 
 fn walk_nodes(dir: &std::path::Path, level: usize, max_depth: usize, out: &mut Vec<Value>) {
+    // Budget: 2000 entries total, counting directories as well as files.
     if level > max_depth || out.len() > 2000 {
         return;
     }
-    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
     let mut entries: Vec<_> = rd.filter_map(|e| e.ok()).collect();
-    entries.sort_by_key(|e| (!e.path().is_dir(), e.file_name().to_string_lossy().to_lowercase()));
+    entries.sort_by_key(|e| {
+        (
+            !e.path().is_dir(),
+            e.file_name().to_string_lossy().to_lowercase(),
+        )
+    });
     for e in entries {
+        if out.len() > 2000 {
+            return;
+        }
         let p = e.path();
+        // Never traverse directory symlinks/junctions: the Files panel must
+        // not escape the workspace or follow a link cycle.
+        let is_link = e.file_type().map(|ft| ft.is_symlink()).unwrap_or(true);
         let kind = if p.is_dir() { "dir" } else { "file" };
+        if is_link && kind == "dir" {
+            continue;
+        }
         out.push(json!({
             "name": e.file_name().to_string_lossy(),
             "path": p.to_string_lossy(),
@@ -704,6 +779,10 @@ fn walk_nodes(dir: &std::path::Path, level: usize, max_depth: usize, out: &mut V
             "depth": level,
         }));
         if kind == "dir" {
+            let name = e.file_name().to_string_lossy().to_lowercase();
+            if crate::fsops::IGNORED_DIRS.contains(&name.as_str()) {
+                continue;
+            }
             walk_nodes(&p, level + 1, max_depth, out);
         }
     }
@@ -711,22 +790,34 @@ fn walk_nodes(dir: &std::path::Path, level: usize, max_depth: usize, out: &mut V
 
 #[tauri::command(rename_all = "camelCase")]
 pub fn read_text_file(path: String, max_bytes: Option<u64>) -> R<Value> {
-    let cap = max_bytes.unwrap_or(200_000).min(2_000_000) as usize;
+    let cap = max_bytes.unwrap_or(200_000).min(2_000_000);
     let p = PathBuf::from(&path);
+    // Size check from metadata BEFORE any bytes are read; the read itself is
+    // bounded so a file can never blow past the cap in memory.
     let md = std::fs::metadata(&p).map_err(|e| e.to_string())?;
-    let bytes = std::fs::read(&p).map_err(|e| e.to_string())?;
-    if bytes.contains(&0) {
+    let bytes = crate::fsops::bounded_read(&p, cap as usize + 1)?;
+    let take = bytes.len().min(cap as usize);
+    if bytes[..take].contains(&0) {
         return Err("Binary file".into());
     }
-    let take = bytes.len().min(cap);
     let content = String::from_utf8_lossy(&bytes[..take]).to_string();
-    Ok(json!({ "content": content, "truncated": take < bytes.len(), "size": md.len() }))
+    Ok(json!({ "content": content, "truncated": take < md.len() as usize, "size": md.len() }))
 }
 
 #[tauri::command(rename_all = "camelCase")]
 pub fn read_file_base64(path: String) -> R<String> {
-    let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
-    if bytes.len() > 8_000_000 {
+    const MAX_ATTACHMENT_BYTES: u64 = 8_000_000;
+    let p = PathBuf::from(&path);
+    let md = std::fs::metadata(&p).map_err(|e| e.to_string())?;
+    if md.len() > MAX_ATTACHMENT_BYTES {
+        return Err(format!(
+            "File too large (max {} MB, this file is {:.1} MB)",
+            MAX_ATTACHMENT_BYTES / 1_000_000,
+            md.len() as f64 / 1_000_000.0
+        ));
+    }
+    let bytes = crate::fsops::bounded_read(&p, MAX_ATTACHMENT_BYTES as usize + 1)?;
+    if bytes.len() as u64 > MAX_ATTACHMENT_BYTES {
         return Err("File too large (max 8 MB)".into());
     }
     use base64::Engine;
@@ -736,11 +827,19 @@ pub fn read_file_base64(path: String) -> R<String> {
 #[tauri::command]
 pub fn open_external(app: AppHandle, target: String) -> R<()> {
     use tauri_plugin_opener::OpenerExt;
-    if target.starts_with("http://") || target.starts_with("https://") {
-        app.opener().open_url(target, None::<&str>).map_err(|e| e.to_string())
-    } else {
-        app.opener().open_path(target, None::<&str>).map_err(|e| e.to_string())
+    // Only well-known safe external schemes are ever opened. Anything else
+    // (file:, javascript:, data:, relative paths, UNC paths…) is rejected:
+    // model-generated links must not be interpreted as local file paths.
+    let lower = target.trim().to_lowercase();
+    let ok = lower.starts_with("http://")
+        || lower.starts_with("https://")
+        || lower.starts_with("mailto:");
+    if !ok {
+        return Err("Only http:, https: and mailto: links can be opened externally".into());
     }
+    app.opener()
+        .open_url(target, None::<&str>)
+        .map_err(|e| e.to_string())
 }
 
 // ---------- processes ----------
@@ -750,9 +849,9 @@ pub fn list_processes(app: AppHandle) -> R<Vec<Value>> {
     terminal::list_json(&app)
 }
 
-#[tauri::command]
-pub fn stop_process(app: AppHandle, id: u32) -> R<()> {
-    terminal::stop(&app, id)
+#[tauri::command(rename_all = "camelCase")]
+pub fn stop_process(app: AppHandle, id: u32, chat_id: Option<String>) -> R<()> {
+    terminal::stop(&app, id, chat_id.as_deref())
 }
 
 #[cfg(test)]
@@ -763,12 +862,11 @@ mod tests {
 
     #[test]
     fn verdict_connected_with_models() {
-        let (s, m) = connection_verdict(
-            Ok(vec!["a".into(), "b".into()]),
-            None,
-            0,
+        let (s, m) = connection_verdict(Ok(vec!["a".into(), "b".into()]), None, 0);
+        assert_eq!(
+            (s.as_str(), m.as_str()),
+            ("connected", "Connected — 2 models available")
         );
-        assert_eq!((s.as_str(), m.as_str()), ("connected", "Connected — 2 models available"));
     }
 
     #[test]
@@ -777,7 +875,10 @@ mod tests {
         let (s, m) = connection_verdict(Ok(vec![]), None, 0);
         assert_eq!(
             (s.as_str(), m.as_str()),
-            ("connected", "Connected — no models discovered. Add a model ID manually.")
+            (
+                "connected",
+                "Connected — no models discovered. Add a model ID manually."
+            )
         );
     }
 
@@ -786,12 +887,18 @@ mod tests {
         let (s, m) = connection_verdict(Ok(vec![]), None, 2);
         assert_eq!(
             (s.as_str(), m.as_str()),
-            ("connected", "Connected — no models discovered. 2 manual models configured.")
+            (
+                "connected",
+                "Connected — no models discovered. 2 manual models configured."
+            )
         );
         let (s, m) = connection_verdict(Ok(vec![]), None, 1);
         assert_eq!(
             (s.as_str(), m.as_str()),
-            ("connected", "Connected — no models discovered. 1 manual model configured.")
+            (
+                "connected",
+                "Connected — no models discovered. 1 manual model configured."
+            )
         );
     }
 
@@ -804,7 +911,10 @@ mod tests {
         );
         assert_eq!(
             (s.as_str(), m.as_str()),
-            ("connected", "Connected — model listing unavailable, using manual model \"my-model\"")
+            (
+                "connected",
+                "Connected — model listing unavailable, using manual model \"my-model\""
+            )
         );
     }
 
@@ -812,7 +922,10 @@ mod tests {
     fn verdict_ping_failure_is_reported_not_the_listing_error() {
         let (s, m) = connection_verdict(
             Err("Provider error 404: no such route".into()),
-            Some(Err("Provider error 401: invalid key — check the API key in Settings › Providers".into())),
+            Some(Err(
+                "Provider error 401: invalid key — check the API key in Settings › Providers"
+                    .into(),
+            )),
             3,
         );
         assert_eq!(s, "failed");
@@ -823,7 +936,10 @@ mod tests {
     #[test]
     fn verdict_no_ping_reports_discovery_error() {
         let (s, m) = connection_verdict(Err("Network error: connection refused".into()), None, 0);
-        assert_eq!((s.as_str(), m.as_str()), ("failed", "Network error: connection refused"));
+        assert_eq!(
+            (s.as_str(), m.as_str()),
+            ("failed", "Network error: connection refused")
+        );
     }
 
     #[test]
@@ -843,11 +959,55 @@ mod tests {
 
     #[test]
     fn ping_candidate_prefers_default_then_manual_then_enabled() {
-        assert_eq!(ping_candidate("default-m", &["manual-m".into()], &["enabled-m".into()]), "default-m");
-        assert_eq!(ping_candidate("", &["manual-m".into()], &["enabled-m".into()]), "manual-m");
+        assert_eq!(
+            ping_candidate("default-m", &["manual-m".into()], &["enabled-m".into()]),
+            "default-m"
+        );
+        assert_eq!(
+            ping_candidate("", &["manual-m".into()], &["enabled-m".into()]),
+            "manual-m"
+        );
         assert_eq!(ping_candidate("", &[], &["enabled-m".into()]), "enabled-m");
         assert_eq!(ping_candidate("", &[], &[]), "");
         // Blank entries are skipped, not returned.
-        assert_eq!(ping_candidate("  ", &["  ".into(), "real".into()], &[]), "real");
+        assert_eq!(
+            ping_candidate("  ", &["  ".into(), "real".into()], &[]),
+            "real"
+        );
+    }
+
+    // ---------- project path canonicalization (drive roots, UNC, verbatim) ----------
+
+    #[test]
+    fn canonical_project_path_keeps_drive_root_separator() {
+        // Trimming `C:\` down to `C:` would make it an invalid relative-drive
+        // path; the root must keep its separator.
+        assert_eq!(canonical_project_path(r"C:\").unwrap(), r"C:\");
+        assert_eq!(canonical_project_path(r"C:\\").unwrap(), r"C:\");
+        // Verbatim input form round-trips to the plain root as well.
+        assert_eq!(canonical_project_path(r"\\?\C:\").unwrap(), r"C:\");
+    }
+
+    #[test]
+    fn canonical_project_path_strips_trailing_separators_and_verbatim_prefix() {
+        let ws = std::env::temp_dir().join(format!("fluxcmd-path-{}", std::process::id()));
+        std::fs::create_dir_all(&ws).unwrap();
+        let got = canonical_project_path(&format!("{}\\", ws.display())).unwrap();
+        let want = ws
+            .to_string_lossy()
+            .replace('/', "\\")
+            .trim_end_matches('\\')
+            .to_string();
+        assert!(got.eq_ignore_ascii_case(&want), "got {got}, want {want}");
+        // Verbatim input form resolves to the same plain path.
+        let got2 = canonical_project_path(&format!(r"\\?\{}", ws.display())).unwrap();
+        assert!(got2.eq_ignore_ascii_case(&got), "got {got2}, want {got}");
+    }
+
+    #[test]
+    fn canonical_project_path_rejects_missing_and_non_folders() {
+        assert!(canonical_project_path("").is_err());
+        assert!(canonical_project_path(r"C:\definitely\not\here").is_err());
+        assert!(canonical_project_path("Cargo.toml").is_err());
     }
 }

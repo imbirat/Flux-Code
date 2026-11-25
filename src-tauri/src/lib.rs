@@ -68,9 +68,9 @@ pub fn run() {
             if let Err(e) = db::migrate_legacy_custom(&handle) {
                 eprintln!("custom provider migration failed: {e}");
             }
-            app.manage(agent::Agents(Default::default()));
-            app.manage(agent::Pending(Default::default()));
-            app.manage(agent::SessionAllow(Default::default()));
+            app.manage(agent::Agents::default());
+            app.manage(agent::Pending::default());
+            app.manage(agent::SessionAllow::default());
             app.manage(terminal::Procs(Default::default()));
             agent::ensure_default_workspace();
             Ok(())

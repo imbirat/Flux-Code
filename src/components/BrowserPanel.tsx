@@ -2,28 +2,26 @@ import { useState } from "react";
 import { ExternalLink, Globe, RefreshCw } from "lucide-react";
 import { useStore } from "../lib/store";
 import { api } from "../lib/tauri";
+import { normalizeHttpUrl } from "../lib/safeUrl";
 import { IconButton, Tip } from "./ui";
-
-const normalize = (input: string): string => {
-  const v = input.trim();
-  if (!v) return "";
-  if (/^https?:\/\//i.test(v)) return v;
-  if (/^[\w.-]+(\.\w+)+(:\d+)?(\/.*)?$/.test(v)) return `https://${v}`;
-  return v;
-};
 
 export default function BrowserPanel() {
   const t = useStore((s) => s.t);
   const [value, setValue] = useState("");
   const [url, setUrl] = useState("");
   const [nonce, setNonce] = useState(0);
+  const [error, setError] = useState("");
 
   const go = () => {
-    const n = normalize(value);
-    if (n) {
-      setUrl(n);
-      setNonce((x) => x + 1);
+    const normalized = normalizeHttpUrl(value);
+    if (!normalized) {
+      setError(t("browser.invalid"));
+      return;
     }
+    setError("");
+    setValue(normalized);
+    setUrl(normalized);
+    setNonce((x) => x + 1);
   };
 
   return (
@@ -37,24 +35,50 @@ export default function BrowserPanel() {
       >
         <input
           value={value}
-          onChange={(e) => setValue(e.target.value)}
+          onChange={(e) => {
+            setValue(e.target.value);
+            if (error) setError("");
+          }}
           placeholder={t("browser.placeholder")}
           spellCheck={false}
-          className="h-6 min-w-0 flex-1 rounded-md border border-line bg-bg px-2 font-mono text-[11.5px] outline-none focus:border-line2"
+          aria-invalid={!!error}
+          className={`h-6 min-w-0 flex-1 rounded-md border bg-bg px-2 font-mono text-[11.5px] outline-none ${
+            error ? "border-err/60 focus:border-err" : "border-line focus:border-line2"
+          }`}
         />
         <Tip text={t("preview.refresh")}>
-          <IconButton className="h-6 w-6" onClick={() => setNonce((n) => n + 1)} title={t("preview.refresh")}>
+          <IconButton
+            className="h-6 w-6"
+            onClick={() => url && setNonce((n) => n + 1)}
+            title={t("preview.refresh")}
+          >
             <RefreshCw size={12} />
           </IconButton>
         </Tip>
         <Tip text={t("preview.openExternal")}>
-          <IconButton className="h-6 w-6" onClick={() => url && api.openExternal(url).catch(() => {})} title={t("preview.openExternal")}>
+          <IconButton
+            className="h-6 w-6"
+            onClick={() => url && api.openExternal(url).catch(() => {})}
+            title={t("preview.openExternal")}
+          >
             <ExternalLink size={12} />
           </IconButton>
         </Tip>
       </form>
+      {error && (
+        <div className="flex-none border-b border-err/30 bg-err/10 px-3 py-1.5 text-[11px] text-err">
+          {error}
+        </div>
+      )}
       {url ? (
-        <iframe key={`${url}-${nonce}`} src={url} title={t("browser.title")} className="min-h-0 flex-1 border-0 bg-white" />
+        <iframe
+          key={`${url}-${nonce}`}
+          src={url}
+          title={t("browser.title")}
+          className="min-h-0 flex-1 border-0 bg-white"
+          sandbox="allow-scripts allow-forms allow-popups allow-modals"
+          referrerPolicy="no-referrer"
+        />
       ) : (
         <div className="flex h-full flex-col items-center justify-center px-6 text-center">
           <Globe size={22} className="text-faint" />

@@ -143,39 +143,38 @@ function ProviderRow({
       <span className="hidden flex-none font-mono text-[10px] text-faint sm:inline">{provider.format}</span>
       <span className="flex-1" />
       <StatusChip status={provider.status} testing={testing} />
-      {status === "not_configured" ? (
+      {status === "not_configured" && (
         <button
           onClick={onAddKey}
           className="flex h-7 flex-none items-center rounded-lg bg-ink px-3 text-[11.5px] font-medium text-bg transition-opacity hover:opacity-85"
         >
           Add Key
         </button>
-      ) : (
-        <>
-          <button
-            onClick={onSelectModels}
-            disabled={!hasModels && status !== "connected"}
-            className="flex h-7 flex-none items-center rounded-lg border border-line px-2.5 text-[11.5px] text-dim transition-colors enabled:hover:bg-hover enabled:hover:text-ink disabled:opacity-40"
-          >
-            Select Models
-          </button>
-          <Menu
-            width={190}
-            align="right"
-            trigger={
-              <IconButton className="h-7 w-7 flex-none" title="Provider options">
-                <MoreHorizontal size={14} />
-              </IconButton>
-            }
-          >
-            {provider.custom && <MenuItem icon={<Pencil size={13} />} label="Edit provider" onClick={onEdit} />}
-            <MenuItem icon={<KeyRound size={13} />} label="Update key" onClick={onAddKey} />
-            <MenuItem icon={<RefreshCw size={13} />} label="Test connection" onClick={onTest} />
-            {provider.custom && <MenuDivider />}
-            {provider.custom && <MenuItem icon={<Trash2 size={13} />} label="Remove provider" onClick={onRemove} />}
-          </Menu>
-        </>
       )}
+      <button
+        onClick={onSelectModels}
+        disabled={!hasModels && status !== "connected"}
+        className="flex h-7 flex-none items-center rounded-lg border border-line px-2.5 text-[11.5px] text-dim transition-colors enabled:hover:bg-hover enabled:hover:text-ink disabled:opacity-40"
+      >
+        Select Models
+      </button>
+      {/* Always available: custom providers must remain editable and removable
+          even before a key exists. */}
+      <Menu
+        width={190}
+        align="right"
+        trigger={
+          <IconButton className="h-7 w-7 flex-none" title="Provider options">
+            <MoreHorizontal size={14} />
+          </IconButton>
+        }
+      >
+        {provider.custom && <MenuItem icon={<Pencil size={13} />} label="Edit provider" onClick={onEdit} />}
+        <MenuItem icon={<KeyRound size={13} />} label="Update key" onClick={onAddKey} />
+        <MenuItem icon={<RefreshCw size={13} />} label="Test connection" onClick={onTest} />
+        {provider.custom && <MenuDivider />}
+        {provider.custom && <MenuItem icon={<Trash2 size={13} />} label="Remove provider" onClick={onRemove} />}
+      </Menu>
       {noEndpoint && (
         <span className="w-full truncate text-[10.5px] text-faint">
           No base URL yet — edit to add an endpoint

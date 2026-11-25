@@ -167,9 +167,21 @@ fn ensure_chat_project_column(conn: &Connection) -> Result<(), String> {
 /// One-time project seeding for databases from before v1.2.3. Creates one
 /// project per distinct chat workspace (plus the default workspace when there
 /// is no project at all) and links every chat to the project matching its
-/// workspace. Never deletes or rewrites existing rows beyond setting the new
-/// `project_id` column.
+/// workspace. A persisted marker guarantees this never runs again, so removing
+/// the last project does not silently recreate it on the next launch.
 pub fn seed_projects(conn: &Connection, default_workspace: &str) -> Result<(), String> {
+    let already: bool = conn
+        .query_row(
+            "SELECT value FROM settings WHERE key = 'projects_seeded'",
+            [],
+            |r| r.get::<_, String>(0),
+        )
+        .map(|v| v.trim() == "true" || v.trim() == "1")
+        .unwrap_or(false);
+    if already {
+        return Ok(());
+    }
+
     let project_count: i64 = conn
         .query_row("SELECT COUNT(*) FROM projects", [], |r| r.get(0))
         .map_err(|e| e.to_string())?;
@@ -177,7 +189,9 @@ pub fn seed_projects(conn: &Connection, default_workspace: &str) -> Result<(), S
         // Projects from the distinct workspaces of existing chats.
         let mut workspaces: Vec<String> = {
             let mut st = conn
-                .prepare("SELECT DISTINCT workspace FROM chats WHERE workspace != '' ORDER BY workspace")
+                .prepare(
+                    "SELECT DISTINCT workspace FROM chats WHERE workspace != '' ORDER BY workspace",
+                )
                 .map_err(|e| e.to_string())?;
             let rows = st
                 .query_map([], |r| r.get::<_, String>(0))
@@ -191,7 +205,7 @@ pub fn seed_projects(conn: &Connection, default_workspace: &str) -> Result<(), S
             workspaces.push(default_workspace.to_string());
         }
         for (i, ws) in workspaces.iter().enumerate() {
-            let path = ws.trim_end_matches(['/', '\\']).to_string();
+            let path = normalize_project_path(ws);
             if path.is_empty() {
                 continue;
             }
@@ -206,8 +220,7 @@ pub fn seed_projects(conn: &Connection, default_workspace: &str) -> Result<(), S
             .map_err(|e| e.to_string())?;
         }
     }
-    // Link chats to the project matching their workspace (case-insensitive),
-    // then fall back to the default project for anything still unassigned.
+    // Link chats to the project matching their workspace (case-insensitive).
     conn.execute(
         "UPDATE chats SET project_id = (
              SELECT p.id FROM projects p
@@ -221,7 +234,7 @@ pub fn seed_projects(conn: &Connection, default_workspace: &str) -> Result<(), S
     let default_project: Option<String> = conn
         .query_row(
             "SELECT id FROM projects WHERE path = ?1 COLLATE NOCASE ORDER BY sort LIMIT 1",
-            [default_workspace.trim_end_matches(['/', '\\'])],
+            [normalize_project_path(default_workspace)],
             |r| r.get(0),
         )
         .ok();
@@ -232,7 +245,28 @@ pub fn seed_projects(conn: &Connection, default_workspace: &str) -> Result<(), S
         )
         .map_err(|e| e.to_string())?;
     }
+    conn.execute(
+        "INSERT INTO settings(key,value) VALUES('projects_seeded','true')
+         ON CONFLICT(key) DO UPDATE SET value = 'true'",
+        [],
+    )
+    .map_err(|e| e.to_string())?;
     Ok(())
+}
+
+/// Normalize a project path for storage: trimmed, without a trailing
+/// separator except for drive roots, where `C:` would be an invalid
+/// drive-relative path and must stay `C:\`.
+pub fn normalize_project_path(path: &str) -> String {
+    let trimmed = path.trim();
+    let stripped = trimmed.trim_end_matches(['/', '\\']);
+    if stripped.len() == 2 && stripped.as_bytes().get(1) == Some(&b':') {
+        format!("{stripped}\\")
+    } else if stripped.is_empty() {
+        trimmed.to_string()
+    } else {
+        stripped.to_string()
+    }
 }
 
 /// Run a closure with the database connection. Never call `.await` inside `f`.
@@ -289,11 +323,24 @@ pub fn create_chat(
 ) -> Result<ChatSummary, String> {
     let id = uid();
     let t = now_ms();
+    let mut final_workspace = workspace.to_string();
+    let mut final_project: Option<String> = None;
     with(app, |c| {
+        // A session's workspace always agrees with its project: when a project
+        // is supplied, the project's canonical path wins. A dangling project id
+        // is dropped rather than stored.
+        if let Some(pid) = project_id {
+            if let Ok(path) = c.query_row("SELECT path FROM projects WHERE id = ?1", [pid], |r| {
+                r.get::<_, String>(0)
+            }) {
+                final_workspace = path;
+                final_project = Some(pid.to_string());
+            }
+        }
         c.execute(
             "INSERT INTO chats(id,title,workspace,provider,model,effort,permission_mode,created_at,updated_at,project_id)
              VALUES(?1,'New chat',?2,?3,?4,?5,?6,?7,?7,?8)",
-            rusqlite::params![id, workspace, provider, model, effort, mode, t, project_id],
+            rusqlite::params![id, final_workspace, provider, model, effort, mode, t, final_project],
         )
         .map_err(|e| e.to_string())?;
         Ok(())
@@ -301,45 +348,97 @@ pub fn create_chat(
     Ok(ChatSummary {
         id,
         title: "New chat".into(),
-        workspace: workspace.into(),
+        workspace: final_workspace,
         provider: provider.into(),
         model: model.into(),
         effort: effort.into(),
         permission_mode: mode.into(),
         created_at: t,
         updated_at: t,
-        project_id: project_id.map(String::from),
+        project_id: final_project,
     })
 }
 
 pub fn update_chat(app: &AppHandle, id: &str, patch: &Value) -> Result<ChatSummary, String> {
     with(app, |c| {
-        let cols = [
+        let current = chat_get_conn(c, id)?;
+        let mut sets: Vec<(String, Option<String>)> = vec![];
+        for (key, col) in [
             ("title", "title"),
-            ("workspace", "workspace"),
             ("provider", "provider"),
             ("model", "model"),
             ("effort", "effort"),
             ("permissionMode", "permission_mode"),
-            ("projectId", "project_id"),
-        ];
-        let mut sets: Vec<String> = vec![];
-        let mut vals: Vec<String> = vec![];
-        for (key, col) in cols {
+        ] {
             if let Some(v) = patch.get(key).and_then(|v| v.as_str()) {
-                sets.push(format!("{col} = ?"));
-                vals.push(v.to_string());
+                sets.push((format!("{col} = ?"), Some(v.to_string())));
             }
         }
-        // projectId may also arrive as null (e.g. its project was removed).
-        if patch.get("projectId").map(|v| v.is_null()).unwrap_or(false) {
-            sets.push("project_id = NULL".into());
+
+        let mut new_workspace = patch
+            .get("workspace")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let mut project_patch: Option<Option<String>> = None;
+
+        if let Some(pv) = patch.get("projectId") {
+            if pv.is_null() {
+                project_patch = Some(None);
+            } else if let Some(pid) = pv.as_str() {
+                // Refuse a dangling association; the workspace follows the
+                // project's canonical path.
+                let path = c
+                    .query_row("SELECT path FROM projects WHERE id = ?1", [pid], |r| {
+                        r.get::<_, String>(0)
+                    })
+                    .map_err(|_| format!("Unknown project: {pid}"))?;
+                project_patch = Some(Some(pid.to_string()));
+                new_workspace = Some(path);
+            }
+        } else if let Some(ws) = &new_workspace {
+            // A workspace change leaves the project when the folder no longer
+            // matches it; keeping the old association would be a silent lie.
+            if let Some(pid) = &current.project_id {
+                let same = c
+                    .query_row("SELECT path FROM projects WHERE id = ?1", [pid], |r| {
+                        r.get::<_, String>(0)
+                    })
+                    .map(|p| p.eq_ignore_ascii_case(ws))
+                    .unwrap_or(false);
+                if !same {
+                    project_patch = Some(None);
+                }
+            }
         }
+
+        if let Some(ws) = new_workspace {
+            let normalized = crate::permissions::resolve_real(std::path::Path::new(&ws))
+                .map(|p| {
+                    crate::permissions::to_plain(&p)
+                        .to_string_lossy()
+                        .to_string()
+                })
+                .unwrap_or(ws);
+            sets.push(("workspace = ?".into(), Some(normalized)));
+        }
+        match project_patch {
+            Some(Some(pid)) => sets.push(("project_id = ?".into(), Some(pid))),
+            Some(None) => sets.push(("project_id = NULL".into(), None)),
+            None => {}
+        }
+
         if !sets.is_empty() {
-            sets.push("updated_at = ?".into());
-            vals.push(now_ms().to_string());
+            sets.push(("updated_at = ?".into(), Some(now_ms().to_string())));
+            let mut parts: Vec<String> = vec![];
+            let mut vals: Vec<String> = vec![];
+            for (expr, val) in &sets {
+                parts.push(expr.clone());
+                if let Some(v) = val {
+                    vals.push(v.clone());
+                }
+            }
             vals.push(id.to_string());
-            let sql = format!("UPDATE chats SET {} WHERE id = ?", sets.join(", "));
+            let sql = format!("UPDATE chats SET {} WHERE id = ?", parts.join(", "));
             c.execute(&sql, rusqlite::params_from_iter(vals.iter()))
                 .map_err(|e| e.to_string())?;
         }
@@ -372,12 +471,14 @@ pub fn rename_chat(app: &AppHandle, id: &str, title: &str) -> Result<(), String>
 
 pub fn delete_chat(app: &AppHandle, id: &str) -> Result<(), String> {
     with(app, |c| {
-        c.execute("DELETE FROM chats WHERE id = ?1", [id])
+        let tx = c.transaction().map_err(|e| e.to_string())?;
+        tx.execute("DELETE FROM messages WHERE chat_id = ?1", [id])
             .map_err(|e| e.to_string())?;
-        c.execute("DELETE FROM messages WHERE chat_id = ?1", [id])
+        tx.execute("DELETE FROM todos WHERE chat_id = ?1", [id])
             .map_err(|e| e.to_string())?;
-        c.execute("DELETE FROM todos WHERE chat_id = ?1", [id])
+        tx.execute("DELETE FROM chats WHERE id = ?1", [id])
             .map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())?;
         Ok(())
     })
 }
@@ -393,16 +494,28 @@ pub fn insert_message(
     let t = now_ms();
     let meta_s = serde_json::to_string(meta).unwrap_or_else(|_| "{}".into());
     with(app, |c| {
-        c.execute(
+        let tx = c.transaction().map_err(|e| e.to_string())?;
+        // Fail closed for a deleted chat: a cancelled or late turn must never
+        // create orphan message rows that could reappear under a reused id.
+        let exists: i64 = tx
+            .query_row("SELECT COUNT(*) FROM chats WHERE id = ?1", [chat_id], |r| {
+                r.get(0)
+            })
+            .map_err(|e| e.to_string())?;
+        if exists == 0 {
+            return Err("Chat no longer exists — message was not saved".into());
+        }
+        tx.execute(
             "INSERT INTO messages(id,chat_id,role,content,meta,created_at) VALUES(?1,?2,?3,?4,?5,?6)",
             rusqlite::params![id, chat_id, role, content, meta_s, t],
         )
         .map_err(|e| e.to_string())?;
-        c.execute(
+        tx.execute(
             "UPDATE chats SET updated_at = ?1 WHERE id = ?2",
             rusqlite::params![t, chat_id],
         )
         .map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())?;
         Ok(())
     })?;
     Ok(StoredMessage {
@@ -412,23 +525,6 @@ pub fn insert_message(
         content: content.into(),
         meta: meta.clone(),
         created_at: t,
-    })
-}
-
-pub fn update_message_content(
-    app: &AppHandle,
-    id: &str,
-    content: &str,
-    meta: &Value,
-) -> Result<(), String> {
-    let meta_s = serde_json::to_string(meta).unwrap_or_else(|_| "{}".into());
-    with(app, |c| {
-        c.execute(
-            "UPDATE messages SET content = ?1, meta = ?2 WHERE id = ?3",
-            rusqlite::params![content, meta_s, id],
-        )
-        .map_err(|e| e.to_string())?;
-        Ok(())
     })
 }
 
@@ -462,7 +558,11 @@ pub fn set_todos(app: &AppHandle, chat_id: &str, items: &[TodoItem]) -> Result<(
         tx.execute("DELETE FROM todos WHERE chat_id = ?1", [chat_id])
             .map_err(|e| e.to_string())?;
         for (i, item) in items.iter().enumerate() {
-            let id = if item.id.is_empty() { uid() } else { item.id.clone() };
+            let id = if item.id.is_empty() {
+                uid()
+            } else {
+                item.id.clone()
+            };
             tx.execute(
                 "INSERT INTO todos(id,chat_id,content,status,sort) VALUES(?1,?2,?3,?4,?5)",
                 rusqlite::params![id, chat_id, item.content, item.status, i as i64],
@@ -498,7 +598,9 @@ pub fn list_todos(app: &AppHandle, chat_id: &str) -> Result<Vec<TodoItem>, Strin
 pub fn setting_get(app: &AppHandle, key: &str, default: Value) -> Value {
     with(app, |c| {
         let default = default.clone();
-        let mut st = c.prepare("SELECT value FROM settings WHERE key = ?1").map_err(|e| e.to_string())?;
+        let mut st = c
+            .prepare("SELECT value FROM settings WHERE key = ?1")
+            .map_err(|e| e.to_string())?;
         let v: String = st
             .query_row([key], |r| r.get(0))
             .unwrap_or_else(|_| default.to_string());
@@ -522,8 +624,12 @@ pub fn setting_set(app: &AppHandle, key: &str, value: &Value) -> Result<(), Stri
 
 pub fn provider_config_get(app: &AppHandle, id: &str) -> Value {
     with(app, |c| {
-        let mut st = c.prepare("SELECT config FROM providers WHERE id = ?1").map_err(|e| e.to_string())?;
-        let v: String = st.query_row([id], |r| r.get(0)).unwrap_or_else(|_| "{}".into());
+        let mut st = c
+            .prepare("SELECT config FROM providers WHERE id = ?1")
+            .map_err(|e| e.to_string())?;
+        let v: String = st
+            .query_row([id], |r| r.get(0))
+            .unwrap_or_else(|_| "{}".into());
         let parsed = serde_json::from_str::<Value>(&v).unwrap_or(Value::Null);
         Ok(parsed)
     })
@@ -664,7 +770,12 @@ pub fn custom_delete(app: &AppHandle, id: &str) -> Result<(), String> {
 }
 
 /// Persist a connection status for a custom provider (status without the key).
-pub fn custom_status_set(app: &AppHandle, id: &str, status: &str, message: &str) -> Result<(), String> {
+pub fn custom_status_set(
+    app: &AppHandle,
+    id: &str,
+    status: &str,
+    message: &str,
+) -> Result<(), String> {
     with(app, |c| {
         c.execute(
             "UPDATE custom_providers SET status = ?2, message = ?3 WHERE id = ?1",
@@ -707,7 +818,7 @@ pub fn list_projects(app: &AppHandle) -> Result<Vec<Project>, String> {
 /// duplicates (the path is UNIQUE COLLATE NOCASE) and races (INSERT OR IGNORE
 /// then re-read). An empty display name falls back to the folder basename.
 fn project_upsert_conn(c: &Connection, path: &str, name: &str) -> Result<Project, String> {
-    let path = path.trim().trim_end_matches(['/', '\\']).to_string();
+    let path = normalize_project_path(path);
     if path.is_empty() {
         return Err("Project path is empty".into());
     }
@@ -729,7 +840,11 @@ fn project_upsert_conn(c: &Connection, path: &str, name: &str) -> Result<Project
         return Ok(existing);
     }
     let sort: i64 = c
-        .query_row("SELECT COALESCE(MAX(sort), -1) + 1 FROM projects", [], |r| r.get(0))
+        .query_row(
+            "SELECT COALESCE(MAX(sort), -1) + 1 FROM projects",
+            [],
+            |r| r.get(0),
+        )
         .map_err(|e| e.to_string())?;
     conn_execute_ignored(
         c,
@@ -746,18 +861,22 @@ fn conn_execute_ignored(
     sql: &str,
     params: impl rusqlite::Params,
 ) -> Result<(), String> {
-    c.execute(sql, params).map(|_| ()).map_err(|e| e.to_string())
+    c.execute(sql, params)
+        .map(|_| ())
+        .map_err(|e| e.to_string())
 }
 
 /// Register (or return) a project for a directory path. The caller must pass
 /// an existing, accessible directory path.
 pub fn project_add(app: &AppHandle, path: &str, name: &str) -> Result<Project, String> {
-    let path = path.trim().trim_end_matches(['/', '\\']).to_string();
+    let path = normalize_project_path(path);
     if path.is_empty() {
         return Err("Project path is empty".into());
     }
     if !std::path::Path::new(&path).is_dir() {
-        return Err(format!("Folder does not exist or is not accessible: {path}"));
+        return Err(format!(
+            "Folder does not exist or is not accessible: {path}"
+        ));
     }
     let name = name.trim();
     if !name.is_empty() && name.len() > 60 {
@@ -776,7 +895,10 @@ pub fn project_rename(app: &AppHandle, id: &str, name: &str) -> Result<Project, 
     }
     with(app, |c| {
         let n = c
-            .execute("UPDATE projects SET name = ?1 WHERE id = ?2", rusqlite::params![name, id])
+            .execute(
+                "UPDATE projects SET name = ?1 WHERE id = ?2",
+                rusqlite::params![name, id],
+            )
             .map_err(|e| e.to_string())?;
         if n == 0 {
             return Err(format!("Unknown project: {id}"));
@@ -791,14 +913,19 @@ pub fn project_rename(app: &AppHandle, id: &str, name: &str) -> Result<Project, 
 /// becomes NULL) or the files on disk.
 pub fn project_remove(app: &AppHandle, id: &str) -> Result<(), String> {
     with(app, |c| {
-        let n = c
+        let tx = c.transaction().map_err(|e| e.to_string())?;
+        let n = tx
             .execute("DELETE FROM projects WHERE id = ?1", [id])
             .map_err(|e| e.to_string())?;
         if n == 0 {
             return Err(format!("Unknown project: {id}"));
         }
-        c.execute("UPDATE chats SET project_id = NULL WHERE project_id = ?1", [id])
-            .map_err(|e| e.to_string())?;
+        tx.execute(
+            "UPDATE chats SET project_id = NULL WHERE project_id = ?1",
+            [id],
+        )
+        .map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())?;
         Ok(())
     })
 }
@@ -863,7 +990,11 @@ pub fn migrate_legacy_custom(app: &AppHandle) -> Result<(), String> {
     let enabled: Vec<String> = config
         .get("enabledModels")
         .and_then(|v| v.as_array())
-        .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(String::from))
+                .collect()
+        })
         .unwrap_or_default();
     let default_model = config
         .get("defaultModel")
@@ -876,7 +1007,11 @@ pub fn migrate_legacy_custom(app: &AppHandle) -> Result<(), String> {
         return Ok(());
     }
 
-    let name = if name.is_empty() { "Custom".to_string() } else { name };
+    let name = if name.is_empty() {
+        "Custom".to_string()
+    } else {
+        name
+    };
     let existing = custom_list(app)?;
     let ids: Vec<String> = existing.iter().map(|p| p.id.clone()).collect();
     let id = crate::providers::unique_custom_id(&slug(&name), &ids);
@@ -921,7 +1056,11 @@ fn slug(name: &str) -> String {
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
         .collect();
     let s = s.trim_matches('-').to_string();
-    if s.is_empty() { "provider".to_string() } else { s }
+    if s.is_empty() {
+        "provider".to_string()
+    } else {
+        s
+    }
 }
 
 #[cfg(test)]
@@ -949,6 +1088,7 @@ mod tests {
                 sort INTEGER NOT NULL DEFAULT 0,
                 created_at INTEGER NOT NULL
             );
+            CREATE TABLE settings(key TEXT PRIMARY KEY, value TEXT NOT NULL);
             CREATE TABLE chats(
                 id TEXT PRIMARY KEY,
                 title TEXT NOT NULL DEFAULT 'New chat',
@@ -989,7 +1129,11 @@ mod tests {
         assert_eq!(titles.len(), 3);
         // Column is real: selecting it works and all values start as NULL.
         let nulls: i64 = conn
-            .query_row("SELECT COUNT(*) FROM chats WHERE project_id IS NULL", [], |r| r.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM chats WHERE project_id IS NULL",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(nulls, 3);
     }
@@ -1011,7 +1155,10 @@ mod tests {
         paths.sort();
         assert_eq!(paths, vec!["C:\\code\\alpha", "C:\\code\\beta"]);
         // Session names derive from the folder.
-        let alpha = projects.iter().find(|p| p.path == "C:\\code\\alpha").unwrap();
+        let alpha = projects
+            .iter()
+            .find(|p| p.path == "C:\\code\\alpha")
+            .unwrap();
         assert_eq!(alpha.name, "alpha");
     }
 
@@ -1023,10 +1170,10 @@ mod tests {
         let chats = chats_list_conn(&conn).unwrap();
         let by_id = |id: &str| chats.iter().find(|c| c.id == id).unwrap();
         // Matched by workspace path (case-insensitive fallback included).
-        assert_eq!(by_id("c1").project_id.as_deref().is_some(), true);
-        assert_eq!(by_id("c2").project_id.as_deref().is_some(), true);
+        assert!(by_id("c1").project_id.as_deref().is_some());
+        assert!(by_id("c2").project_id.as_deref().is_some());
         // Empty workspace chat lands on the default project.
-        assert_eq!(by_id("c3").project_id.as_deref().is_some(), true);
+        assert!(by_id("c3").project_id.as_deref().is_some());
         let alpha = projects_list_conn(&conn)
             .unwrap()
             .into_iter()
@@ -1078,7 +1225,10 @@ mod tests {
     #[test]
     fn chat_rows_roundtrip_project_id() {
         let conn = fresh();
-        conn.execute_batch("INSERT INTO projects(id,name,path,sort,created_at) VALUES('p1','Alpha','C:\\a',0,1)").unwrap();
+        conn.execute_batch(
+            "INSERT INTO projects(id,name,path,sort,created_at) VALUES('p1','Alpha','C:\\a',0,1)",
+        )
+        .unwrap();
         let chat = ChatSummary {
             id: "ch1".into(),
             title: "T".into(),
@@ -1114,17 +1264,48 @@ mod tests {
                  VALUES('ch1','C:\\a',1,2,'p1');",
         )
         .unwrap();
-        conn.execute("DELETE FROM projects WHERE id = 'p1'", []).unwrap();
-        conn.execute("UPDATE chats SET project_id = NULL WHERE project_id = 'p1'", [])
+        // Run the migration once so the one-time marker is persisted.
+        seed_projects(&conn, "C:\\a").unwrap();
+        // Simulate project removal (transactional delete + unlink).
+        conn.execute("DELETE FROM projects WHERE id = 'p1'", [])
             .unwrap();
+        conn.execute(
+            "UPDATE chats SET project_id = NULL WHERE project_id = 'p1'",
+            [],
+        )
+        .unwrap();
         // The session survives with no project association.
         let chats = chats_list_conn(&conn).unwrap();
         assert_eq!(chats.len(), 1);
         assert_eq!(chats[0].project_id, None);
-        // ...and can be re-seeded later by matching its workspace.
+        // Seeding is a one-time migration: it must NOT recreate the removed
+        // project or silently relink the session on the next launch.
         seed_projects(&conn, "C:\\a").unwrap();
+        assert!(projects_list_conn(&conn).unwrap().is_empty());
         let chats = chats_list_conn(&conn).unwrap();
-        assert!(chats[0].project_id.is_some());
+        assert_eq!(chats[0].project_id, None);
+        seed_projects(&conn, "C:\\a").unwrap();
+        assert!(projects_list_conn(&conn).unwrap().is_empty());
+    }
+
+    #[test]
+    fn seed_marker_prevents_default_project_recreation_after_removal() {
+        let conn = fresh();
+        seed_projects(&conn, "C:\\code\\default").unwrap();
+        assert_eq!(projects_list_conn(&conn).unwrap().len(), 1);
+        conn.execute("DELETE FROM projects", []).unwrap();
+        seed_projects(&conn, "C:\\code\\default").unwrap();
+        // Removing the last project is user intent, not a reason to seed again.
+        assert!(projects_list_conn(&conn).unwrap().is_empty());
+    }
+
+    #[test]
+    fn project_path_normalization_preserves_drive_roots() {
+        assert_eq!(normalize_project_path(r"C:\"), r"C:\");
+        assert_eq!(normalize_project_path(r"C:\\"), r"C:\");
+        assert_eq!(normalize_project_path(r"C:\code\alpha\\"), r"C:\code\alpha");
+        assert_eq!(normalize_project_path("  "), "");
+        assert_eq!(normalize_project_path(r"\\srv\share\"), r"\\srv\share");
     }
 
     #[test]

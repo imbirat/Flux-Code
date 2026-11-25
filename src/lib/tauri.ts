@@ -92,7 +92,8 @@ export const api = {
   readFileBase64: (path: string) => invoke<string>("read_file_base64", { path }),
   openExternal: (target: string) => invoke<void>("open_external", { target }),
   listProcesses: () => invoke<ProcessInfo[]>("list_processes"),
-  stopProcess: (id: number) => invoke<void>("stop_process", { id }),
+  stopProcess: (id: number, chatId?: string) =>
+    invoke<void>("stop_process", { id, chatId: chatId ?? null }),
 };
 
 /** True when running inside the Tauri desktop shell (not a plain browser). */

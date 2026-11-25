@@ -27,7 +27,10 @@ fn build_messages(req: &LlmRequest) -> Vec<Value> {
                         parts.push(json!({ "type": "text", "text": m.content }));
                     }
                     for img in &images {
-                        let mime = img.get("mime").and_then(|v| v.as_str()).unwrap_or("image/png");
+                        let mime = img
+                            .get("mime")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("image/png");
                         let data = img.get("data").and_then(|v| v.as_str()).unwrap_or("");
                         if !data.is_empty() {
                             parts.push(json!({
@@ -70,7 +73,11 @@ fn build_messages(req: &LlmRequest) -> Vec<Value> {
                 out.push(Value::Object(msg));
             }
             "tool" => {
-                let id = m.meta.get("toolCallId").and_then(|v| v.as_str()).unwrap_or("");
+                let id = m
+                    .meta
+                    .get("toolCallId")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
                 out.push(json!({ "role": "tool", "tool_call_id": id, "content": m.content }));
             }
             _ => {}
@@ -102,7 +109,10 @@ pub async fn stream(
     }
     let m = ctx.model.to_lowercase();
     if ctx.provider_id == "openai"
-        && (m.starts_with("o1") || m.starts_with("o3") || m.starts_with("o4") || m.starts_with("gpt-5"))
+        && (m.starts_with("o1")
+            || m.starts_with("o3")
+            || m.starts_with("o4")
+            || m.starts_with("gpt-5"))
     {
         body["max_completion_tokens"] = json!(16384);
     } else {
@@ -124,7 +134,10 @@ pub async fn stream(
     for (k, v) in &ctx.extra_headers {
         http = http.header(k.as_str(), v.as_str());
     }
-    let resp = http.send().await.map_err(|e| format!("Network error: {e}"))?;
+    let resp = http
+        .send()
+        .await
+        .map_err(|e| format!("Network error: {e}"))?;
     let status = resp.status();
     if !status.is_success() {
         let text = resp.text().await.unwrap_or_default();
@@ -178,9 +191,14 @@ pub async fn stream(
                     }
                     if let Some(tcs) = delta.get("tool_calls").and_then(|t| t.as_array()) {
                         for tc in tcs {
-                            let idx = tc.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as usize;
+                            let idx =
+                                tc.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as usize;
                             while calls.len() <= idx {
-                                calls.push(Call { id: String::new(), name: String::new(), args: String::new() });
+                                calls.push(Call {
+                                    id: String::new(),
+                                    name: String::new(),
+                                    args: String::new(),
+                                });
                             }
                             if let Some(id) = tc.get("id").and_then(|i| i.as_str()) {
                                 if !id.is_empty() {
@@ -213,9 +231,17 @@ pub async fn stream(
         .into_iter()
         .enumerate()
         .map(|(i, c)| ToolCall {
-            id: if c.id.is_empty() { format!("call_{i}") } else { c.id },
+            id: if c.id.is_empty() {
+                format!("call_{i}")
+            } else {
+                c.id
+            },
             name: c.name,
-            args_json: if c.args.trim().is_empty() { "{}".into() } else { c.args },
+            args_json: if c.args.trim().is_empty() {
+                "{}".into()
+            } else {
+                c.args
+            },
         })
         .collect();
     Ok(StreamResult {

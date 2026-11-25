@@ -1,0 +1,114 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  frontend:
+    name: Frontend (check, test, build)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: Install dependencies
+        run: npm.cmd ci
+      - name: TypeScript check
+        run: npm.cmd run check
+      - name: Unit tests
+        run: npm.cmd run test
+      - name: Production build
+        run: npm.cmd run build
+      - name: Upload frontend build
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-dist
+          path: dist
+          if-no-files-found: warn
+
+  rust:
+    name: Rust (fmt, test, clippy)
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: src-tauri
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+      - name: Prepare frontend dist for compile-time context
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path ../dist | Out-Null
+          if (-not (Test-Path ../dist/index.html)) {
+            Set-Content -Path ../dist/index.html -Value '<!doctype html><html><body></body></html>'
+          }
+      - name: Format check
+        run: cargo fmt --all -- --check
+      - name: Tests
+        shell: bash
+        run: cargo test --all-targets --all-features 2>&1 | tee rust-test.log
+      - name: Clippy (deny warnings)
+        shell: bash
+        run: cargo clippy --all-targets --all-features -- -D warnings 2>&1 | tee rust-clippy.log
+      - name: Upload Rust logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rust-logs
+          path: |
+            src-tauri/rust-test.log
+            src-tauri/rust-clippy.log
+          if-no-files-found: warn
+
+  tauri-build:
+    name: Windows Tauri build
+    runs-on: windows-latest
+    needs: [frontend, rust]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+      - name: Install dependencies
+        run: npm.cmd ci
+      - name: Build installers
+        run: npm.cmd run tauri build
+      - name: Checksums
+        shell: pwsh
+        run: |
+          $files = Get-ChildItem -Path "src-tauri/target/release/bundle" -Recurse -File -Include *.exe,*.msi
+          $files | ForEach-Object {
+            $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $_.FullName).Hash.ToLower()
+            "$hash  $($_.FullName)"
+          } | Set-Content -Path "src-tauri/target/release/bundle/SHA256SUMS.txt"
+          Get-Content "src-tauri/target/release/bundle/SHA256SUMS.txt"
+      - name: Upload installers
+        uses: actions/upload-artifact@v4
+        with:
+          name: flux-windows-installers
+          path: |
+            src-tauri/target/release/Flux.exe
+            src-tauri/target/release/bundle/**/*.exe
+            src-tauri/target/release/bundle/**/*.msi
+            src-tauri/target/release/bundle/SHA256SUMS.txt
+          if-no-files-found: error

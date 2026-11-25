@@ -21,7 +21,11 @@ fn build_contents(req: &LlmRequest) -> Vec<Value> {
     let mut pending_fn: Vec<Value> = vec![];
     for m in &req.messages {
         if m.role == "tool" {
-            let name = m.meta.get("toolName").and_then(|v| v.as_str()).unwrap_or("tool");
+            let name = m
+                .meta
+                .get("toolName")
+                .and_then(|v| v.as_str())
+                .unwrap_or("tool");
             pending_fn.push(json!({
                 "functionResponse": { "name": name, "response": { "result": m.content } }
             }));
@@ -39,7 +43,10 @@ fn build_contents(req: &LlmRequest) -> Vec<Value> {
                     parts.push(json!({ "text": m.content }));
                 }
                 for img in &images {
-                    let mime = img.get("mime").and_then(|v| v.as_str()).unwrap_or("image/png");
+                    let mime = img
+                        .get("mime")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("image/png");
                     let data = img.get("data").and_then(|v| v.as_str()).unwrap_or("");
                     if !data.is_empty() {
                         parts.push(json!({ "inlineData": { "mimeType": mime, "data": data } }));
@@ -133,7 +140,10 @@ pub async fn stream(
     for (k, v) in &ctx.extra_headers {
         http = http.header(k.as_str(), v.as_str());
     }
-    let resp = http.send().await.map_err(|e| format!("Network error: {e}"))?;
+    let resp = http
+        .send()
+        .await
+        .map_err(|e| format!("Network error: {e}"))?;
     let status = resp.status();
     if !status.is_success() {
         let text = resp.text().await.unwrap_or_default();
@@ -169,7 +179,11 @@ pub async fn stream(
                 }
                 if let Some(parts) = c.pointer("/content/parts").and_then(|p| p.as_array()) {
                     for part in parts {
-                        if part.get("thought").and_then(|t| t.as_bool()).unwrap_or(false) {
+                        if part
+                            .get("thought")
+                            .and_then(|t| t.as_bool())
+                            .unwrap_or(false)
+                        {
                             if let Some(t) = part.get("text").and_then(|t| t.as_str()) {
                                 if !t.is_empty() {
                                     acc_think.push_str(t);
@@ -180,12 +194,27 @@ pub async fn stream(
                         }
                         if let Some(fc) = part.get("functionCall") {
                             let idx = calls.len();
-                            let name = fc.get("name").and_then(|n| n.as_str()).unwrap_or("").to_string();
+                            let name = fc
+                                .get("name")
+                                .and_then(|n| n.as_str())
+                                .unwrap_or("")
+                                .to_string();
                             let id = format!("fc_{idx}");
                             let args = fc.get("args").cloned().unwrap_or(json!({})).to_string();
-                            calls.push(Call { id: id.clone(), name: name.clone(), args: args.clone() });
-                            on_delta(&Delta::ToolStart { index: idx, id, name });
-                            on_delta(&Delta::ToolArgs { index: idx, delta: args });
+                            calls.push(Call {
+                                id: id.clone(),
+                                name: name.clone(),
+                                args: args.clone(),
+                            });
+                            on_delta(&Delta::ToolStart {
+                                index: idx,
+                                id,
+                                name,
+                            });
+                            on_delta(&Delta::ToolArgs {
+                                index: idx,
+                                delta: args,
+                            });
                             continue;
                         }
                         if let Some(t) = part.get("text").and_then(|t| t.as_str()) {
@@ -210,7 +239,11 @@ pub async fn stream(
         .map(|c| ToolCall {
             id: c.id,
             name: c.name,
-            args_json: if c.args.trim().is_empty() { "{}".into() } else { c.args },
+            args_json: if c.args.trim().is_empty() {
+                "{}".into()
+            } else {
+                c.args
+            },
         })
         .collect();
     Ok(StreamResult {

@@ -120,6 +120,21 @@ describe("ProjectsHome", () => {
     expect(screen.getByTestId("project-row-p2")).toBeTruthy();
   });
 
+  it("keeps the All Projects selection across project refreshes", async () => {
+    seed([], null);
+    await useStore.getState().refreshProjects();
+    // A refresh must not silently jump back into the first project.
+    expect(useStore.getState().activeProjectId).toBeNull();
+  });
+
+  it("persists All Projects instead of a project id", async () => {
+    seed([]);
+    useStore.getState().setActiveProject(null);
+    await waitFor(() =>
+      expect(mocks.setSettings).toHaveBeenCalledWith({ lastProjectId: "" }),
+    );
+  });
+
   it("groups sessions by date with Today/Yesterday labels", () => {
     const chats = [
       chat({ id: "today", title: "Fresh session", projectId: "p1", updatedAt: NOW - H }),

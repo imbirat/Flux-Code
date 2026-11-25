@@ -8,8 +8,19 @@ use serde_json::Value;
 pub enum Delta {
     Text(String),
     Thinking(String),
-    ToolStart { index: usize, id: String, name: String },
-    ToolArgs { index: usize, delta: String },
+    // Tool deltas are consumed by provider-specific accumulators; the shared
+    // agent loop uses the final `tool_calls` vector instead.
+    #[allow(dead_code)]
+    ToolStart {
+        index: usize,
+        id: String,
+        name: String,
+    },
+    #[allow(dead_code)]
+    ToolArgs {
+        index: usize,
+        delta: String,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -78,7 +89,114 @@ pub fn base(base: &str) -> String {
     base.trim_end_matches('/').to_string()
 }
 
-/// Feed an SSE response body to `f`, one `data:` payload per call.
+/// Upper bound for one buffered SSE line/event. Protects memory against a
+/// provider that never sends a newline or emits an enormous event.
+const MAX_SSE_BUFFER_BYTES: usize = 8 * 1024 * 1024;
+
+/// Incremental Server-Sent Events parser.
+///
+/// Bytes are buffered until a complete line terminator is seen, so a UTF-8
+/// sequence split across network chunks is never decoded in pieces. Handles
+/// LF, CRLF and CR line endings, multi-line `data:` fields, comments and
+/// unknown fields, and a final event without a trailing blank line.
+pub(crate) struct SseParser {
+    buf: Vec<u8>,
+    data: String,
+    has_data: bool,
+}
+
+impl SseParser {
+    pub(crate) fn new() -> Self {
+        Self {
+            buf: Vec::new(),
+            data: String::new(),
+            has_data: false,
+        }
+    }
+
+    fn dispatch(&mut self) -> Option<String> {
+        if self.has_data {
+            self.has_data = false;
+            Some(std::mem::take(&mut self.data))
+        } else {
+            None
+        }
+    }
+
+    fn handle_line(&mut self, raw: &[u8]) -> Result<Option<String>, String> {
+        // A blank line terminates the event.
+        if raw.is_empty() {
+            return Ok(self.dispatch());
+        }
+        // Lines are decoded whole, so multi-byte characters are intact here.
+        let line = String::from_utf8_lossy(raw);
+        if line.starts_with(':') {
+            return Ok(None); // comment / keep-alive
+        }
+        let (field, value) = match line.find(':') {
+            Some(i) => (&line[..i], &line[i + 1..]),
+            None => (line.as_ref(), ""),
+        };
+        if field != "data" {
+            return Ok(None);
+        }
+        let value = value.strip_prefix(' ').unwrap_or(value);
+        if self.has_data {
+            self.data.push('\n');
+        }
+        self.data.push_str(value);
+        self.has_data = true;
+        if self.data.len() > MAX_SSE_BUFFER_BYTES {
+            return Err("SSE event exceeded the size limit".into());
+        }
+        Ok(None)
+    }
+
+    /// Feed raw bytes; returns every event completed by this chunk.
+    pub(crate) fn feed(&mut self, bytes: &[u8]) -> Result<Vec<String>, String> {
+        self.buf.extend_from_slice(bytes);
+        let mut out = Vec::new();
+        while let Some(pos) = self.buf.iter().position(|b| *b == b'\n' || *b == b'\r') {
+            let is_cr = self.buf[pos] == b'\r';
+            // A trailing CR may be the first half of CRLF; wait for more input.
+            if is_cr && pos + 1 >= self.buf.len() {
+                break;
+            }
+            let consume = if is_cr {
+                if self.buf.get(pos + 1) == Some(&b'\n') {
+                    pos + 2
+                } else {
+                    pos + 1
+                }
+            } else {
+                pos + 1
+            };
+            let raw: Vec<u8> = self.buf.drain(..consume).collect();
+            let line = &raw[..pos];
+            if let Some(ev) = self.handle_line(line)? {
+                out.push(ev);
+            }
+        }
+        if self.buf.len() > MAX_SSE_BUFFER_BYTES {
+            return Err("SSE line exceeded the size limit".into());
+        }
+        Ok(out)
+    }
+
+    /// Flush a final event that was not followed by a blank line.
+    pub(crate) fn finish(&mut self) -> Result<Option<String>, String> {
+        if !self.buf.is_empty() {
+            let raw = std::mem::take(&mut self.buf);
+            let raw = raw.strip_suffix(b"\r").unwrap_or(&raw);
+            if let Some(ev) = self.handle_line(raw)? {
+                return Ok(Some(ev));
+            }
+        }
+        Ok(self.dispatch())
+    }
+}
+
+/// Feed an SSE response body to `f`, one event payload per call.
 /// Return `false` from `f` to stop reading early.
 pub(crate) async fn sse_events<F>(resp: reqwest::Response, mut f: F) -> Result<(), String>
 where
@@ -86,21 +204,17 @@ where
 {
     use futures_util::StreamExt;
     let mut stream = resp.bytes_stream();
-    let mut buf = String::new();
+    let mut parser = SseParser::new();
     while let Some(chunk) = stream.next().await {
         let bytes = chunk.map_err(|e| e.to_string())?;
-        buf.push_str(&String::from_utf8_lossy(&bytes));
-        while let Some(pos) = buf.find("\n\n") {
-            let msg: String = buf.drain(..pos + 2).collect();
-            for line in msg.lines() {
-                if let Some(data) = line.strip_prefix("data:") {
-                    let data = data.strip_prefix(' ').unwrap_or(data);
-                    if !f(data) {
-                        return Ok(());
-                    }
-                }
+        for event in parser.feed(&bytes)? {
+            if !f(&event) {
+                return Ok(());
             }
         }
+    }
+    if let Some(event) = parser.finish()? {
+        let _ = f(&event);
     }
     Ok(())
 }
@@ -132,7 +246,11 @@ pub fn effort_values(provider_id: &str, model: &str) -> Option<Vec<String>> {
     let supported = |values: &[&str]| Some(values.iter().map(|s| s.to_string()).collect());
     match provider_id {
         "openai" => {
-            if m.starts_with("o1") || m.starts_with("o3") || m.starts_with("o4") || m.starts_with("gpt-5") {
+            if m.starts_with("o1")
+                || m.starts_with("o3")
+                || m.starts_with("o4")
+                || m.starts_with("gpt-5")
+            {
                 supported(&["low", "medium", "high"])
             } else {
                 None
@@ -158,8 +276,18 @@ pub fn effort_values(provider_id: &str, model: &str) -> Option<Vec<String>> {
         }
         "openrouter" => {
             let hints = [
-                "o1-", "o3-", "o4-", "gpt-5", "deepseek-r1", "deepseek-reasoner", "qwq",
-                "thinking", "gemini-2.5", "claude-3-7", "claude-sonnet-4", "claude-opus-4",
+                "o1-",
+                "o3-",
+                "o4-",
+                "gpt-5",
+                "deepseek-r1",
+                "deepseek-reasoner",
+                "qwq",
+                "thinking",
+                "gemini-2.5",
+                "claude-3-7",
+                "claude-sonnet-4",
+                "claude-opus-4",
             ];
             if hints.iter().any(|h| m.contains(h)) {
                 supported(&["low", "medium", "high"])
@@ -179,5 +307,76 @@ pub fn effort_values(provider_id: &str, model: &str) -> Option<Vec<String>> {
         }
         // Custom providers are never assumed to support reasoning effort.
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SseParser;
+
+    fn events(parser: &mut SseParser, bytes: &[u8]) -> Vec<String> {
+        parser.feed(bytes).unwrap()
+    }
+
+    #[test]
+    fn splits_utf8_across_chunks_without_mangling() {
+        let mut p = SseParser::new();
+        let full = "data: {\"t\":\"héllo 🌊\"}\n\n".as_bytes().to_vec();
+        // Split in the middle of the multi-byte emoji.
+        let split = full
+            .windows(3)
+            .position(|w| w == "🌊".as_bytes().get(..3).unwrap())
+            .unwrap()
+            + 1;
+        assert!(events(&mut p, &full[..split]).is_empty());
+        let got = events(&mut p, &full[split..]);
+        assert_eq!(got, vec!["{\"t\":\"héllo 🌊\"}"]);
+    }
+
+    #[test]
+    fn handles_crlf_and_multiline_data() {
+        let mut p = SseParser::new();
+        let got = events(
+            &mut p,
+            b"event: message\r\ndata: line one\r\ndata: line two\r\n\r\n",
+        );
+        assert_eq!(got, vec!["line one\nline two"]);
+    }
+
+    #[test]
+    fn ignores_comments_and_unknown_fields() {
+        let mut p = SseParser::new();
+        let got = events(&mut p, b": keep-alive\nid: 7\nretry: 10\ndata: real\n\n");
+        assert_eq!(got, vec!["real"]);
+    }
+
+    #[test]
+    fn flushes_a_final_event_without_trailing_blank_line() {
+        let mut p = SseParser::new();
+        assert!(events(&mut p, b"data: tail").is_empty());
+        assert_eq!(p.finish().unwrap().as_deref(), Some("tail"));
+    }
+
+    #[test]
+    fn preserves_done_sentinel_for_adapters() {
+        let mut p = SseParser::new();
+        let got = events(&mut p, b"data: [DONE]\n\n");
+        assert_eq!(got, vec!["[DONE]"]);
+    }
+
+    #[test]
+    fn data_without_space_and_empty_data_are_supported() {
+        let mut p = SseParser::new();
+        let got = events(&mut p, b"data:x\ndata:\n\n");
+        assert_eq!(got, vec!["x\n"]);
+    }
+
+    #[test]
+    fn cr_only_line_endings_are_supported() {
+        let mut p = SseParser::new();
+        // A trailing CR is ambiguous (it may be half of a CRLF split across
+        // chunks), so it is resolved by the next chunk or by finish().
+        assert!(events(&mut p, b"data: a\rdata: b\r\r").is_empty());
+        assert_eq!(p.finish().unwrap().as_deref(), Some("a\nb"));
     }
 }

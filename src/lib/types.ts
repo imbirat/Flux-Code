@@ -158,10 +158,14 @@ export interface ToolLive {
 
 export interface ProcessInfo {
   id: number;
+  chatId: string;
   name: string;
   command: string;
   startedAt: number;
+  /** -1 while running, otherwise the exit code. */
   exited: number;
+  running: boolean;
+  state: "running" | "stopping" | "exited";
   recentOutput: string[];
 }
 

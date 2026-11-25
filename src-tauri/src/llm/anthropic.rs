@@ -27,7 +27,11 @@ fn build_messages(req: &LlmRequest) -> Vec<Value> {
     let mut pending: Vec<Value> = vec![];
     for m in &req.messages {
         if m.role == "tool" {
-            let id = m.meta.get("toolCallId").and_then(|v| v.as_str()).unwrap_or("");
+            let id = m
+                .meta
+                .get("toolCallId")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             pending.push(json!({
                 "type": "tool_result",
                 "tool_use_id": id,
@@ -50,7 +54,10 @@ fn build_messages(req: &LlmRequest) -> Vec<Value> {
                         parts.push(json!({ "type": "text", "text": m.content }));
                     }
                     for img in &images {
-                        let mime = img.get("mime").and_then(|v| v.as_str()).unwrap_or("image/png");
+                        let mime = img
+                            .get("mime")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("image/png");
                         let data = img.get("data").and_then(|v| v.as_str()).unwrap_or("");
                         if !data.is_empty() {
                             parts.push(json!({
@@ -151,7 +158,9 @@ pub async fn stream(
         let budget = budget_for(e);
         body["thinking"] = json!({ "type": "enabled", "budget_tokens": budget });
         body["max_tokens"] = json!(budget + 12288);
-    } else if ctx.model.to_lowercase().contains("haiku") && !ctx.model.to_lowercase().contains("haiku-4") {
+    } else if ctx.model.to_lowercase().contains("haiku")
+        && !ctx.model.to_lowercase().contains("haiku-4")
+    {
         body["max_tokens"] = json!(8192);
     }
 
@@ -166,7 +175,10 @@ pub async fn stream(
     for (k, v) in &ctx.extra_headers {
         http = http.header(k.as_str(), v.as_str());
     }
-    let resp = http.send().await.map_err(|e| format!("Network error: {e}"))?;
+    let resp = http
+        .send()
+        .await
+        .map_err(|e| format!("Network error: {e}"))?;
     let status = resp.status();
     if !status.is_success() {
         let text = resp.text().await.unwrap_or_default();
@@ -205,11 +217,24 @@ pub async fn stream(
                     "text" => blocks[idx] = json!({ "type": "text", "text": "" }),
                     "thinking" => blocks[idx] = json!({ "type": "thinking", "thinking": "" }),
                     "tool_use" => {
-                        let id = cb.get("id").and_then(|x| x.as_str()).unwrap_or("").to_string();
-                        let name = cb.get("name").and_then(|x| x.as_str()).unwrap_or("").to_string();
-                        blocks[idx] = json!({ "type": "tool_use", "id": id, "name": name, "input": {} });
+                        let id = cb
+                            .get("id")
+                            .and_then(|x| x.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let name = cb
+                            .get("name")
+                            .and_then(|x| x.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        blocks[idx] =
+                            json!({ "type": "tool_use", "id": id, "name": name, "input": {} });
                         arg_raw.insert(idx, String::new());
-                        on_delta(&Delta::ToolStart { index: idx, id, name });
+                        on_delta(&Delta::ToolStart {
+                            index: idx,
+                            id,
+                            name,
+                        });
                     }
                     _ => {}
                 }
@@ -252,7 +277,10 @@ pub async fn stream(
                         let s = d.get("partial_json").and_then(|t| t.as_str()).unwrap_or("");
                         if !s.is_empty() {
                             arg_raw.entry(idx).or_default().push_str(s);
-                            on_delta(&Delta::ToolArgs { index: idx, delta: s.to_string() });
+                            on_delta(&Delta::ToolArgs {
+                                index: idx,
+                                delta: s.to_string(),
+                            });
                         }
                     }
                     _ => {}
@@ -287,9 +315,21 @@ pub async fn stream(
         if b.get("type").and_then(|t| t.as_str()) == Some("tool_use") {
             let args_raw = arg_raw.get(&i).cloned().unwrap_or_default();
             tool_calls.push(ToolCall {
-                id: b.get("id").and_then(|x| x.as_str()).unwrap_or("").to_string(),
-                name: b.get("name").and_then(|x| x.as_str()).unwrap_or("").to_string(),
-                args_json: if args_raw.trim().is_empty() { "{}".into() } else { args_raw },
+                id: b
+                    .get("id")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                name: b
+                    .get("name")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                args_json: if args_raw.trim().is_empty() {
+                    "{}".into()
+                } else {
+                    args_raw
+                },
             });
         }
     }
